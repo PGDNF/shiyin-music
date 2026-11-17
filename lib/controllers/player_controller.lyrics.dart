@@ -1,0 +1,539 @@
+// player_controller.lyrics.dart —— PlayerController 的职责分片：歌词与逐行广播（歌词加载/SuperLyric/车载蓝牙歌词）。成员声明与字段见 player_controller.dart。
+part of 'player_controller.dart';
+
+mixin _PlayerLyrics on _PlayerControllerBase {
+  /// 本地歌词匹配/缓存服务：首次加载本地歌曲时懒建。
+  ///
+  /// 懒建的原因：`cacheService` / `localMusic` 由 `main.dart` 在 controller
+  /// 创建后注入，构造期可能还是 null；首次真正加载本地歌词时注入值已就绪。
+  /// 内嵌歌词由 [LocalMusicController.getEmbeddedLyrics] 读取（Rust
+  /// `readLocalLyrics` / Android MethodChannel），避免引入上游的
+  /// `audio_metadata_reader` 依赖。
+  LocalLyricsService? _localLyricsService;
+
+  LocalLyricsService _ensureLocalLyricsService() => _localLyricsService ??=
+      LocalLyricsService(
+        api: _api,
+        cache: cacheService,
+        embeddedLyricsReader: (path) async {
+          final reader = localMusic;
+          if (reader == null) return null;
+          return reader.getEmbeddedLyrics(path);
+        },
+      );
+
+  /// 开关车载蓝牙歌词广播（默认关闭，避免无车机时多余广播）。
+  Future<void> setBluetoothLyricsEnabled(bool enabled) async {
+    if (bluetoothLyricsEnabled == enabled) return;
+    bluetoothLyricsEnabled = enabled;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_bluetoothLyricsEnabledSettingKey, enabled);
+    // 手环/AVRCP 标题同步是「车载蓝牙歌词」的下级开关：关闭后标题必须
+    // 立即回落歌名（开关同时被隐藏，用户无法再单独关它）。
+    _applyBluetoothLyricsTitleSyncSetting();
+    if (!enabled && currentSong != null) {
+      unawaited(
+        _bluetoothLyrics.broadcastMetaChanged(
+          title: currentSong!.title,
+          artist: currentSong!.artist,
+          album: currentSong!.albumName,
+          lyric: '',
+          position: position,
+          duration: currentSong!.duration ?? Duration.zero,
+          playing: isPlaying,
+          trackIndex: currentIndex,
+          listSize: queue.length,
+        ),
+      );
+    } else if (enabled) {
+      _pushBluetoothLyricForCurrentLine(force: true);
+    }
+    notifyListeners();
+  }
+
+  @override
+  Future<void> loadLyrics(Song song) async {
+    // 歌词缓存在独立文件里（LyricCacheService）：不再写 SharedPreferences。
+    // 历史上 `cache_lyric_<hash>` 把 prefs 撑到十几 MB，Windows 每次写 prefs
+    // 都要整文件 JSON 编解码，是启动/切歌卡顿的主因（详见 PrefsCompaction）。
+    final lyricCache = LyricCacheService.instance;
+
+    if (song.source == SongSource.local) {
+      // 本地歌：同名 .lrc → 音频内嵌歌词 → 本地缓存 → 元数据在线匹配缓存。
+      // 空/无效 .lrc 不得抑制内嵌或在线歌词、失败静默返回空、同歌并发加载
+      // in-flight 去重等细节都在 LocalLyricsService 内（含单测）。
+      final lines = await _ensureLocalLyricsService().load(song);
+      if (currentSong?.hash == song.hash) {
+        lyrics = lines;
+        notifyListeners();
+        _syncDesktopLyrics();
+        _syncMediaSessionLyricFromPosition();
+      }
+      return;
+    }
+
+    // 1. 先读缓存，命中则立即显示（无感）
+    if (lyricCache.enabled) {
+      try {
+        final cached = await lyricCache.read(song.hash);
+        if (cached != null &&
+            !listEquals(lyrics, cached) &&
+            currentSong?.hash == song.hash) {
+          lyrics = cached;
+          notifyListeners();
+          _syncDesktopLyrics();
+          // 歌词就绪即推媒体会话（mini/锁屏读 metadata），不等下一个位置 tick。
+          _syncMediaSessionLyricFromPosition();
+        }
+      } catch (_) {}
+    }
+
+    // 2. 后台静默刷新
+    try {
+      final fresh = await _api.lyrics(song);
+      if (currentSong?.hash == song.hash && !listEquals(lyrics, fresh)) {
+        lyrics = fresh;
+        notifyListeners();
+        _syncMediaSessionLyricFromPosition();
+      }
+      // 写缓存（空歌词也缓存，避免重复请求）。文件缓存写入失败只记日志，
+      // 不能影响歌词展示。
+      if (lyricCache.enabled) {
+        unawaited(lyricCache.write(song.hash, fresh));
+      }
+    } catch (_) {
+      // 拉取失败保持静默：此时 lyrics 若非空必为本歌缓存数据（切歌时
+      // playSong 已先清空），清掉只会丢好数据；若为空则任何通知都会与
+      // 进页兜底（ensureLyricsLoaded）互相触发，形成无限重拉循环。
+      // 冷启动首歌一次网络抖动就会整首无词（mini/锁屏没有进页兜底）：
+      // 每首歌至多补拉一次，3 秒后仍为空才重试，失败不再循环。
+      if (currentSong?.hash == song.hash &&
+          lyrics.isEmpty &&
+          _lyricFetchRetriedHash != song.hash) {
+        _lyricFetchRetriedHash = song.hash;
+        Timer(const Duration(seconds: 3), () {
+          if (!_disposed &&
+              currentSong?.hash == song.hash &&
+              lyrics.isEmpty) {
+            unawaited(loadLyrics(song));
+          }
+        });
+      }
+    }
+    if (currentSong?.hash == song.hash) {
+      _syncDesktopLyrics();
+    }
+  }
+
+  /// 进入播放页时的兜底：[loadLyrics] 只在 [playSong] 成功加载音频后触发，
+  /// 恢复播放/请求失败等路径下歌词可能为空，进页必须补拉一次。
+  /// 已有歌词时直接返回，不产生额外请求。
+  Future<void> ensureLyricsLoaded() async {
+    final song = currentSong;
+    if (song == null || lyrics.isNotEmpty) return;
+    // 同一首歌的拉取已在进行中则跳过，防止页面 didUpdateWidget 反复触发并发重拉。
+    if (_lyricsFetchInFlightHash == song.hash) return;
+    _lyricsFetchInFlightHash = song.hash;
+    try {
+      await loadLyrics(song);
+    } finally {
+      // 无论成功失败都释放，切歌后新歌的兜底拉取不被卡住。
+      if (_lyricsFetchInFlightHash == song.hash) {
+        _lyricsFetchInFlightHash = null;
+      }
+    }
+  }
+
+  // ---- 歌词进度偏移 ----
+  // 设计见 docs/superpowers/specs/2026-09-21-lyric-progress-offset-design.md。
+
+  /// 步进调节当前歌曲的歌词进度（[delta] 为正 = 歌词提前，例如
+  /// [kLyricOffsetStep] 表示提前 0.5 秒）。
+  @override
+  Future<void> adjustLyricOffset(Duration delta) =>
+      setLyricOffset(lyricOffset + delta);
+
+  /// 直接把当前歌曲的偏移设为 [value]（超过 ±[kLyricOffsetLimit] 会被夹取）。
+  ///
+  /// 偏移落定后按歌曲持久化：0 即删除记录，非 0 记录毫秒值（酷狗/QQ 音乐
+  /// 同款"这首歌字幕偏了"的一次性修正，换歌不受影响、下次播放仍生效）。
+  @override
+  Future<void> setLyricOffset(Duration value) async {
+    final next = PlayerLyricOffsetLogic.clamp(value, kLyricOffsetLimit);
+    if (next == lyricOffset) return;
+    lyricOffset = next;
+    final song = currentSong;
+    if (song != null) {
+      // 先删再插：Map 保持插入序，重新插入即把该歌顶到 LRU 最新端。
+      _lyricOffsets.remove(song.hash);
+      if (next != Duration.zero) {
+        _lyricOffsets[song.hash] = next.inMilliseconds;
+      }
+      while (_lyricOffsets.length > kLyricOffsetStoreLimit) {
+        _lyricOffsets.remove(_lyricOffsets.keys.first);
+      }
+    }
+    _notifyLyricOffsetChanged();
+    await _scheduleLyricOffsetPersist();
+  }
+
+  /// 偏移落盘调度：空闲态首调立即写（单击语义与旧版一致，可确定性断言），
+  /// 随后开 [_kLyricOffsetPersistWindow] 窗口；窗口内的后调只记脏。
+  /// 窗口结束时若脏则尾写一次并按需续窗——`− / +` 长按连调 130ms 一步，
+  /// 不合并的话 20 秒长按≈150 次 SharedPreferences 写，合并后首写＋尾写
+  /// 共 2 次。并发重入（理论上只有连点才碰得到）：后调记脏合并，
+  /// 最坏多一次幂等的全量覆盖，无正确性问题。
+  Future<void> _scheduleLyricOffsetPersist() async {
+    if (_lyricOffsetPersistDebounce != null) {
+      _lyricOffsetPersistDirty = true;
+      return;
+    }
+    await _persistLyricOffsets();
+    if (_disposed) return;
+    _lyricOffsetPersistDebounce = Timer(
+      _kLyricOffsetPersistWindow,
+      _onLyricOffsetPersistWindow,
+    );
+  }
+
+  void _onLyricOffsetPersistWindow() {
+    _lyricOffsetPersistDebounce = null;
+    if (_lyricOffsetPersistDirty) {
+      _lyricOffsetPersistDirty = false;
+      unawaited(_persistLyricOffsets());
+      if (!_disposed) {
+        _lyricOffsetPersistDebounce = Timer(
+          _kLyricOffsetPersistWindow,
+          _onLyricOffsetPersistWindow,
+        );
+      }
+    }
+  }
+
+  /// 尽快落盘窗口内未写入的偏移（dispose 时防抖窗口还有脏值）。
+  void _flushPendingLyricOffsetPersist() {
+    final pending = _lyricOffsetPersistDebounce?.isActive ?? false;
+    _lyricOffsetPersistDebounce?.cancel();
+    _lyricOffsetPersistDebounce = null;
+    if (pending && _lyricOffsetPersistDirty) {
+      _lyricOffsetPersistDirty = false;
+      unawaited(_persistLyricOffsets());
+    }
+  }
+
+  /// 重置当前歌曲的歌词进度（回到"以歌词自带时间为准"）。
+  ///
+  /// 重置是 deliberate 的单次动作（按钮不可长按连调）：先取消防抖窗口
+  /// 再走正常落盘，保证语义确定、可断言；否则紧跟 ± 后的重置会被记脏、
+  /// 延迟到窗口结束才生效。
+  @override
+  Future<void> resetLyricOffset() async {
+    _lyricOffsetPersistDebounce?.cancel();
+    _lyricOffsetPersistDebounce = null;
+    _lyricOffsetPersistDirty = false;
+    await setLyricOffset(Duration.zero);
+  }
+
+  /// 装载某首歌自己的偏移（切歌、启动恢复时调用）；无记录即归零。
+  @override
+  void _loadLyricOffsetForSong(Song? song) {
+    final next = Duration(
+      milliseconds: song == null ? 0 : (_lyricOffsets[song.hash] ?? 0),
+    );
+    if (next == lyricOffset) return;
+    lyricOffset = next;
+    _notifyLyricOffsetChanged();
+  }
+
+  /// 偏移变更后的统一广播。
+  ///
+  /// 三路"上一句"缓存必须一起失效：否则悬浮窗/超级歌词/蓝牙要等到下一句
+  /// 才换文本；再主动补推一次，让当前句与逐字进度立刻按新偏移重排。
+  void _notifyLyricOffsetChanged() {
+    if (_disposed) return;
+    _lastDesktopLyricIndex = -1;
+    _lastSuperLyricIndex = -1;
+    _lastBluetoothLyricIndex = -1;
+    notifyListeners();
+    _syncDesktopLyrics();
+    _syncDesktopKaraokeProgress();
+    _syncSuperLyricFromPosition();
+    _syncBluetoothLyricsFromPosition();
+  }
+
+  Future<void> _persistLyricOffsets() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (_lyricOffsets.isEmpty) {
+      // 全部归零就把键删掉，不给下次启动留一份空 JSON。
+      await prefs.remove(_lyricOffsetsSettingKey);
+      return;
+    }
+    await prefs.setString(_lyricOffsetsSettingKey, jsonEncode(_lyricOffsets));
+  }
+
+  /// 启动恢复逐曲偏移映射。恢复后由调用方再对齐当前歌（构造函数里
+  /// [_restoreSettings] 与 [_restorePlaybackState] 都是 unawaited 发起，
+  /// 恢复映射时可能已经有歌在播了）。
+  ///
+  /// **不清空内存镜像**：读取落盘值之前，用户可能已经在播放页调过偏移，
+  /// 那是更新的真值（磁盘上要么还没有这个键、要么还是旧值），所以按
+  /// "内存优先"合并——否则启动瞬间的调整会被恢复流程抹回 0。
+  @override
+  void _restoreLyricOffsets(SharedPreferences prefs) {
+    final raw = prefs.getString(_lyricOffsetsSettingKey);
+    if (raw == null || raw.isEmpty) return;
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is Map) {
+        for (final entry in decoded.entries) {
+          final key = entry.key;
+          final value = entry.value;
+          if (key is String && value is num) {
+            _lyricOffsets.putIfAbsent(key, () => value.round());
+          }
+        }
+      }
+    } catch (error) {
+      debugPrint('[时音][歌词] 歌词进度偏移恢复失败（跳过）: $error');
+    }
+  }
+
+  void _syncSuperLyricFromPosition() {
+    if (currentSong == null) return;
+    if (lyrics.isEmpty) {
+      if (!isPlaying && _lastSuperLyricPlaying) {
+        _lastSuperLyricPlaying = false;
+        _lastSuperLyricIndex = -1;
+        unawaited(_superLyric.sendStop());
+      } else if (isPlaying && !_lastSuperLyricPlaying) {
+        _lastSuperLyricPlaying = true;
+      }
+      return;
+    }
+    final index = activeLyricIndex;
+    final lineChanged = isPlaying && (index != _lastSuperLyricIndex);
+    final resumed = isPlaying && !_lastSuperLyricPlaying;
+    if (lineChanged || resumed) {
+      _lastSuperLyricIndex = index;
+      _lastSuperLyricPlaying = true;
+      final clampedIndex = index.clamp(0, lyrics.length - 1);
+      final line = lyrics[clampedIndex];
+      final lineEndTime =
+          line.time +
+          (line.duration ??
+              _estimatedLineDuration(clampedIndex) ??
+              Duration.zero);
+      unawaited(
+        _superLyric.sendLyric(
+          song: currentSong!,
+          line: line,
+          lineEndTime: lineEndTime,
+        ),
+      );
+    } else if (!isPlaying && _lastSuperLyricPlaying) {
+      _lastSuperLyricPlaying = false;
+      unawaited(_superLyric.sendStop());
+    }
+  }
+
+  void _syncBluetoothLyricsFromPosition() {
+    // 系统媒体会话歌词（ColorOS/OriginOS 锁屏岛、Lyricon 等）与蓝牙广播
+    // 开关无关，但共用同一个「位置流歌词同步」入口：先无条件同步系统歌词，
+    // 再按开关决定是否发车机广播（triage §4.1）。
+    _syncMediaSessionLyricFromPosition();
+    if (!bluetoothLyricsEnabled) return;
+    if (currentSong == null) return;
+    final index = lyrics.isEmpty ? -1 : activeLyricIndex;
+    final lineChanged = index != _lastBluetoothLyricIndex;
+    final playingChanged = isPlaying != _lastBluetoothPlaying;
+    if (lineChanged || playingChanged) {
+      _pushBluetoothLyricForCurrentLine(
+        index: index,
+        forcePlayState: playingChanged,
+      );
+    }
+    // 行内心跳：车机端按 position 自行滚动需要连续的位置流（issue #22）。
+    // 换行广播由上面的 lineChanged 分支负责，这里只补「同一行内」的进度。
+    _maybePushBluetoothPositionHeartbeat();
+  }
+
+  /// 同一歌词行内的周期性位置心跳（节流见 [_kBluetoothLyricHeartbeat]）。
+  ///
+  /// 只在「播放中 + 有歌词 + 距上次广播超过节流窗口」时发送，暂停/停止/
+  /// 无歌词/切歌后均不发送——这些状态下发广播只会让车机端误判进度。
+  void _maybePushBluetoothPositionHeartbeat() {
+    if (!isPlaying || lyrics.isEmpty) return;
+    final now = bluetoothLyricNow();
+    final last = _lastBluetoothBroadcastAt;
+    if (last != null && now.difference(last) < _kBluetoothLyricHeartbeat) {
+      return;
+    }
+    _pushBluetoothLyricForCurrentLine(force: true);
+  }
+
+  void _pushBluetoothLyricForCurrentLine({
+    bool force = false,
+    int? index,
+    bool forcePlayState = false,
+  }) {
+    if (!bluetoothLyricsEnabled || currentSong == null) return;
+    final song = currentSong!;
+    final resolvedIndex = index ?? (lyrics.isEmpty ? -1 : activeLyricIndex);
+    final prevIndex = _lastBluetoothLyricIndex;
+
+    final String lyricText;
+    if (lyrics.isEmpty || resolvedIndex < 0) {
+      lyricText = '';
+      _lastBluetoothLyricIndex = -1;
+    } else {
+      final clampedIndex = resolvedIndex.clamp(0, lyrics.length - 1);
+      lyricText = lyrics[clampedIndex].text;
+      _lastBluetoothLyricIndex = clampedIndex;
+    }
+
+    _lastBluetoothPlaying = isPlaying;
+
+    final lineChanged = force || prevIndex != _lastBluetoothLyricIndex;
+    if (lineChanged) {
+      // 行变化广播与行内心跳共用节流基准：本次发送后 [_kBluetoothLyricHeartbeat]
+      // 窗口内心跳直接跳过，避免同一行内容背靠背重复广播。
+      _lastBluetoothBroadcastAt = bluetoothLyricNow();
+      unawaited(
+        _bluetoothLyrics.broadcastMetaChanged(
+          title: song.title,
+          artist: song.artist,
+          album: song.albumName,
+          lyric: lyricText,
+          // 整首 LRC 与当前行一起下发：车机端按 position 自行滚动高亮
+          // 需要全量时间轴（issue #22）。复用 MediaSession 路径的缓存，
+          // 歌词列表未换新时不重复格式化。
+          fullLyric: _mediaSessionFullLrc,
+          position: position,
+          duration: song.duration ?? Duration.zero,
+          playing: isPlaying,
+          trackIndex: currentIndex,
+          listSize: queue.length,
+        ),
+      );
+    }
+    if (forcePlayState) {
+      unawaited(
+        _bluetoothLyrics.broadcastPlayStateChanged(
+          title: song.title,
+          artist: song.artist,
+          album: song.albumName,
+          position: position,
+          duration: song.duration ?? Duration.zero,
+          playing: isPlaying,
+        ),
+      );
+    }
+  }
+
+  // ---- 系统媒体会话歌词（LyricInfo/extras，上游 3.3.0 #134/#151）--------
+  //
+  // ColorOS/OriginOS 锁屏岛、状态栏歌词与 Lyricon/LyricProvider 等三方歌词
+  // 插件只从 MediaSession metadata（extras/lyricInfo）取歌词。它是一套通用
+  // 系统能力，**不依赖** [bluetoothLyricsEnabled]（上游把这段挂在蓝牙开关里，
+  // 导致不开车机就完全没有系统歌词；fork 按 triage §4.1 拆开）。手环/AVRCP
+  // 的「标题=歌词行」覆盖则受 [bluetoothLyricsTitleSyncEnabled] 控制。
+
+  /// 系统歌词协议只对 Android 系统媒体会话有消费方（ColorOS/OriginOS/
+  /// Lyricon）；桌面 SMTC/MPRIS 没有对应读取方，每行一次 mediaItem.add 只会
+  /// 白刷元数据（triage §4.1 风险项），故按平台短路。
+  static bool get _isMediaSessionLyricPlatform =>
+      !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+
+  /// 整首标准 LRC：按歌词列表 identity 缓存，只在列表换新时格式化一次
+  /// （禁止每个位置 tick 重复拼接整首歌词）。
+  String? get _mediaSessionFullLrc {
+    if (!identical(_mediaSessionFullLrcSource, lyrics)) {
+      _mediaSessionFullLrcSource = lyrics;
+      _mediaSessionFullLrcCache = LrcFormatter.buildFullLrc(lyrics);
+    }
+    return _mediaSessionFullLrcCache;
+  }
+
+  /// 空串视为无内容（MediaSession extras 里省略该键而非写空串）。
+  String? _nonEmptyLyricText(String? value) =>
+      value == null || value.isEmpty ? null : value;
+
+  /// 位置流中的系统媒体会话歌词同步。
+  ///
+  /// 推送时机（其余 tick 直接返回，不重建 MediaItem）：
+  /// - 歌词行变化（含歌词列表换新，翻译/音译随新列表一起更新）；
+  /// - 暂停后恢复播放（重推当前行，暂停时已清空）；
+  /// - 切歌后新歌当前行（切歌时先清空旧歌，再按新歌状态推/等歌词加载）。
+  ///
+  /// 清空时机：切歌、暂停、无歌曲、播放中但没有歌词（纯音乐/歌词未加载）。
+  /// 清空是幂等的（同一状态只 add 一次），避免暂停期间每 tick 重建通知。
+  /// 手环标题开关切换不经过这里：handler 收到开关后会用歌词快照自行重建标题。
+  void _syncMediaSessionLyricFromPosition() {
+    if (!_isMediaSessionLyricPlatform) return;
+    final song = currentSong;
+    final identity = song == null ? null : _songIdentity(song);
+    final sameSong =
+        identity != null && _mediaSessionLyricSongIdentity == identity;
+    final songChanged = !sameSong;
+    final lyricsChanged = !identical(_mediaSessionLyricLines, lyrics);
+    final wasPlaying = _mediaSessionLyricPlaying;
+    _mediaSessionLyricSongIdentity = identity;
+    _mediaSessionLyricLines = lyrics;
+    _mediaSessionLyricPlaying = isPlaying;
+
+    // 无歌曲/切歌/暂停：旧歌词必须立刻从锁屏消失。只清一次：索引 -1 表示
+    // 已清空/从未发布，重复 add 只会白白重建媒体通知。
+    if (song == null || songChanged || !isPlaying) {
+      if (_mediaSessionLyricIndex != -1) {
+        _mediaSessionLyricIndex = -1;
+        _audioHandler.updateLyricMetadata();
+      }
+      if (song == null || !isPlaying) return;
+      // 切歌且仍在播放：继续往下尝试推新歌当前行（歌词可能已就绪）。
+    }
+
+    final index = lyrics.isEmpty ? -1 : activeLyricIndex;
+    final lineChanged = index != _mediaSessionLyricIndex;
+    final resumed = !wasPlaying;
+    if (!lineChanged && !resumed && !lyricsChanged) return;
+    _mediaSessionLyricIndex = index;
+    if (index < 0) {
+      // 播放中但无可显示歌词：上面已清空（或从未发布），标记索引即可。
+      return;
+    }
+    final clampedIndex = index.clamp(0, lyrics.length - 1);
+    final line = lyrics[clampedIndex];
+    _audioHandler.updateLyricMetadata(
+      // 空文本行（间奏占位）不发布为当前行，但整首 LRC 仍保留，锁屏滚动
+      // 歌词不会因此整体消失（见 MusicAudioHandler.buildLyricInfoJson）。
+      lyricText: _nonEmptyLyricText(line.text),
+      translationText: _nonEmptyLyricText(line.translation),
+      romanizationText: _nonEmptyLyricText(line.romanization),
+      fullLyricLrc: _mediaSessionFullLrc,
+    );
+  }
+
+  /// 开关手环/AVRCP 歌词标题同步（仅在车载蓝牙歌词开启时可见）。
+  ///
+  /// 真正下发 handler 的是「车载蓝牙歌词 && 本开关」的合成值：关闭车载
+  /// 蓝牙歌词后本开关被隐藏，若不合成用户就再也关不掉标题覆盖。
+  Future<void> setBluetoothLyricsTitleSyncEnabled(bool enabled) async {
+    if (bluetoothLyricsTitleSyncEnabled == enabled) return;
+    bluetoothLyricsTitleSyncEnabled = enabled;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_bluetoothLyricsTitleSyncSettingKey, enabled);
+    _applyBluetoothLyricsTitleSyncSetting();
+    notifyListeners();
+  }
+
+  /// 下发「车载蓝牙歌词 && 手环标题同步」的合成开关。
+  ///
+  /// handler 收到后会立即用最近一次歌词快照重建 MediaItem（标题立刻生效/
+  /// 回落），无需控制器再补推：暂停态快照为空则只回落歌名。
+  void _applyBluetoothLyricsTitleSyncSetting() {
+    final effective = bluetoothLyricsEnabled && bluetoothLyricsTitleSyncEnabled;
+    if (effective == _bluetoothLyricsTitleSyncApplied) return;
+    _bluetoothLyricsTitleSyncApplied = effective;
+    _audioHandler.setBluetoothLyricsTitleSync(effective);
+  }
+}

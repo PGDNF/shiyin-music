@@ -1,0 +1,1497 @@
+package shiyin.famlife.top
+
+import android.Manifest
+import android.app.DownloadManager
+import android.content.BroadcastReceiver
+import android.content.ContentUris
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageManager
+import android.database.Cursor
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
+import android.provider.Settings
+import android.media.MediaScannerConnection
+import android.media.audiofx.BassBoost
+import android.media.audiofx.Equalizer
+import android.media.audiofx.LoudnessEnhancer
+import android.media.audiofx.Virtualizer
+import android.os.Handler
+import android.util.Log
+import android.os.Looper
+import android.view.KeyEvent
+import android.view.WindowManager
+import android.widget.Toast
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
+import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.MethodChannel
+import com.ryanheise.audioservice.AudioServiceActivity
+import com.hchen.superlyricapi.SuperLyricHelper
+import com.hchen.superlyricapi.SuperLyricData
+import com.hchen.superlyricapi.SuperLyricLine
+import com.hchen.superlyricapi.SuperLyricWord
+import java.io.File
+import kotlin.concurrent.thread
+
+class MainActivity : AudioServiceActivity() {
+    private val updateDownloads = mutableMapOf<Long, String>()
+    private var downloadReceiverRegistered = false
+    private var lyricsStateReceiverRegistered = false
+    private var desktopLyricsChannel: MethodChannel? = null
+    // 车机方向盘媒体键前台兜底（issue #15）：部分车机把方控 KeyEvent 直接
+    // 派发到前台 Activity，audio_service 的 MediaSession 收不到。
+    private var carMediaKeyHandler: CarMediaKeyHandler? = null
+    private var superLyricChannel: MethodChannel? = null
+    private var superLyricRegistered = false
+    private var vivoLyricsChannel: MethodChannel? = null
+    // audio_effects channel 引用,供响度分析中途反向 invokeMethod 推进度给 Dart。
+    private var audioEffectsChannel: MethodChannel? = null
+    private var bassBoost: BassBoost? = null
+    private var bassBoostSessionId: Int? = null
+    private var equalizer: Equalizer? = null
+    private var equalizerSessionId: Int? = null
+    private var loudnessEnhancer: LoudnessEnhancer? = null
+    private var loudnessEnhancerSessionId: Int? = null
+    private var virtualizer: Virtualizer? = null
+    private var virtualizerSessionId: Int? = null
+    // 当前响度分析的取消标志。切歌时调用 cancelLoudnessAnalysis 置 true,
+    // 让解码循环立即结束,避免旧歌曲分析空跑占 CPU。
+    @Volatile private var loudnessAnalysisCancelled: Boolean = false
+    private var pendingPermissionResult: MethodChannel.Result? = null
+    // 「所有文件访问」（自定义下载目录到公共文件夹）申请中的回调：系统设置页
+    // 返回后按 Environment.isExternalStorageManager() 的真实结果回给 Dart。
+    private var pendingStorageResult: MethodChannel.Result? = null
+    // AI / 外部 DeepLink（shiyin://）：原生只负责搬运 intent，解析与执行
+    // 全在 Dart 侧（channel: shiyin_music/deep_link）。冷启动链接先暂存在
+    // 这里，等 Dart 主动 getInitialLink 时取走。
+    private var deepLinkChannel: MethodChannel? = null
+    private var initialDeepLink: String? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    companion object {
+        private const val REQUEST_READ_AUDIO = 1001
+        private const val REQUEST_ALL_FILES_ACCESS = 1002
+        private const val REQUEST_WRITE_STORAGE = 1003
+        private const val TAG_SUPER_LYRIC = "SuperLyricPublisher"
+        private const val TAG_BLUETOOTH_LYRICS = "BluetoothLyrics"
+        private const val TAG_LYRICS_OVERLAY = "LyricsOverlay"
+        private const val TAG_DEEP_LINK = "DeepLink"
+        private const val DEEP_LINK_SCHEME = "shiyin://"
+    }
+
+    // 桌面歌词 intent 的 fire-and-forget 拉起。用户点关闭后服务已 stopSelf，
+    // Dart 侧补发的显式 hide 会落在"进程短暂不持有任何前台服务"的窗口期，
+    // Android 12+ 后台启动限制下 startService 可能抛 IllegalStateException；
+    // 歌词推送本就有下一次推送 / Flutter 侧 show 兜底，这里吞掉记日志即可，
+    // 不让 method-channel handler 里的未捕获异常带崩应用。
+    private fun startLyricsService(intent: Intent) {
+        runCatching { startService(intent) }
+            .onFailure {
+                Log.w(TAG_LYRICS_OVERLAY, "startService 失败，本次忽略: ${it.message}")
+            }
+    }
+
+    private val downloadReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val downloadId = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
+            val fileName = updateDownloads.remove(downloadId) ?: return
+            if (isDownloadSuccessful(downloadId)) {
+                installDownloadedApk(fileName)
+            }
+        }
+    }
+
+    private val lyricsStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action != LyricsOverlayService.ACTION_VISIBILITY_CHANGED) {
+                return
+            }
+            desktopLyricsChannel?.invokeMethod(
+                "onVisibilityChanged",
+                mapOf(
+                    "visible" to intent.getBooleanExtra(
+                        LyricsOverlayService.EXTRA_VISIBLE,
+                        false
+                    ),
+                    "userClosed" to intent.getBooleanExtra(
+                        LyricsOverlayService.EXTRA_USER_CLOSED,
+                        false
+                    )
+                )
+            )
+        }
+    }
+
+    // 冷启动入口：仅"全新启动"（savedInstanceState == null）时把 VIEW intent
+    // 视为初始 DeepLink。Activity 被系统回收后重建会复用原始 intent，若也
+    // 暂存，Dart 侧前台补拉会把同一条链接再执行一次。
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        if (savedInstanceState == null) {
+            intent?.dataString?.let { data ->
+                if (data.startsWith(DEEP_LINK_SCHEME)) {
+                    initialDeepLink = data
+                }
+            }
+        }
+    }
+
+    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+        super.configureFlutterEngine(flutterEngine)
+
+        // 车机方向盘媒体键兜底（issue #15）：前台 Activity 收到标准媒体键时
+        // 经 MethodChannel 转给 Dart 播控；后台仍由 audio_service 的
+        // MediaSession 处理（通知栏/锁屏/蓝牙 AVRCP）。
+        carMediaKeyHandler = CarMediaKeyHandler(this, flutterEngine)
+
+        // AI / 外部 DeepLink（shiyin://）：VIEW intent 的 data 交给 Dart 解析
+        // 与执行。冷启动链接已在 onCreate 暂存，由 Dart 的 getInitialLink 取走
+        // （取走后置空，Dart 可在 Activity 重建后回前台时补拉一次）；热启动
+        // （singleTop 复用）走 onNewIntent 主动推送。
+        deepLinkChannel = MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            "shiyin_music/deep_link"
+        ).apply {
+            setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "getInitialLink" -> {
+                        result.success(initialDeepLink)
+                        initialDeepLink = null
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+        }
+
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "shiyin_music/screen")
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "setKeepScreenOn" -> {
+                        val enabled = call.arguments as? Boolean ?: false
+                        if (enabled) {
+                            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                        } else {
+                            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                        }
+                        result.success(null)
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+
+        // 车机检测：isAutomotive 判别车机。
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "shiyin_music/device")
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "isAutomotive" -> result.success(isAutomotiveDevice())
+                    else -> result.notImplemented()
+                }
+            }
+
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "shiyin_music/update")
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    // 渠道包识别：返回运行时 applicationId（Configure 里
+                    // -PcustomPackageName 覆盖时即为自定义包名）。Dart 侧
+                    // 据此判断是否官方包、是否跳过在线更新检查。
+                    "getPackageName" -> result.success(packageName)
+                    "downloadAndInstallApk" -> {
+                        val url = call.argument<String>("url")
+                        val fileName = call.argument<String>("fileName") ?: "shiyin_update.apk"
+                        if (url.isNullOrBlank()) {
+                            result.error("invalid_url", "APK download url is empty", null)
+                            return@setMethodCallHandler
+                        }
+
+                        runCatching {
+                            enqueueApkDownload(url, fileName)
+                        }.onSuccess {
+                            result.success(null)
+                        }.onFailure { error ->
+                            result.error("download_failed", error.message, null)
+                        }
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "shiyin_music/audio_effects")
+            .also { audioEffectsChannel = it }
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "getEqualizerConfig" -> {
+                        val audioSessionId = call.argument<Int>("audioSessionId")
+                        runCatching {
+                            equalizerConfig(audioSessionId)
+                        }.onSuccess { config ->
+                            result.success(config)
+                        }.onFailure { error ->
+                            result.error("equalizer_config_failed", error.message, null)
+                        }
+                    }
+                    "configureEqualizer" -> {
+                        val audioSessionId = call.argument<Int>("audioSessionId")
+                        val enabled = call.argument<Boolean>("enabled") ?: false
+                        val levels = call.argument<List<Int>>("levels") ?: emptyList()
+
+                        runCatching {
+                            configureEqualizer(audioSessionId, enabled, levels)
+                        }.onSuccess { supported ->
+                            result.success(supported)
+                        }.onFailure { error ->
+                            releaseEqualizer()
+                            result.error("equalizer_failed", error.message, null)
+                        }
+                    }
+                    "configureBassBoost" -> {
+                        val audioSessionId = call.argument<Int>("audioSessionId")
+                        val enabled = call.argument<Boolean>("enabled") ?: false
+                        val strength = call.argument<Int>("strength") ?: 0
+
+                        runCatching {
+                            configureBassBoost(audioSessionId, enabled, strength)
+                        }.onSuccess { supported ->
+                            result.success(supported)
+                        }.onFailure { error ->
+                            releaseBassBoost()
+                            result.error("bass_boost_failed", error.message, null)
+                        }
+                    }
+                    "configureVirtualizer" -> {
+                        val audioSessionId = call.argument<Int>("audioSessionId")
+                        val enabled = call.argument<Boolean>("enabled") ?: false
+                        val strength = call.argument<Int>("strength") ?: 0
+
+                        runCatching {
+                            configureVirtualizer(audioSessionId, enabled, strength)
+                        }.onSuccess { supported ->
+                            result.success(supported)
+                        }.onFailure { error ->
+                            releaseVirtualizer()
+                            result.error("virtualizer_failed", error.message, null)
+                        }
+                    }
+                    "analyzeLoudness" -> {
+                        val url = call.argument<String>("url")
+                        val maxDurationMs = call.argument<Int>("maxDurationMs") ?: 1800000
+                        val progressIntervalMs = call.argument<Int>("progressIntervalMs") ?: 500
+                        if (url.isNullOrBlank()) {
+                            result.error("invalid_url", "url is null or empty", null)
+                            return@setMethodCallHandler
+                        }
+                        Log.i("Loudness", "channel analyzeLoudness 收到 url=$url interval=${progressIntervalMs}ms")
+                        // 每次新分析重置取消标志。切歌时 Dart 侧调 cancelLoudnessAnalysis
+                        // 置 true,解码循环检测到后立即抛异常结束,不再空跑。
+                        loudnessAnalysisCancelled = false
+                        val channel = audioEffectsChannel
+                        thread {
+                            try {
+                                val analyzed = LoudnessAnalyzer.analyze(
+                                    url,
+                                    maxDurationMs,
+                                    progressIntervalMs,
+                                    isCancelled = { loudnessAnalysisCancelled },
+                                    onProgress = { lufs, analyzedMs ->
+                                        // 反向 invokeMethod 把中途 LUFS 推给 Dart,
+                                        // Dart 侧用序号守卫决定是否应用。切到主线程调用
+                                        // (Flutter MethodChannel 要求主线程)。
+                                        if (channel != null && !loudnessAnalysisCancelled) {
+                                            mainHandler.post {
+                                                channel.invokeMethod(
+                                                    "onLoudnessProgress",
+                                                    mapOf(
+                                                        "lufs" to lufs,
+                                                        "analyzedMs" to analyzedMs
+                                                    )
+                                                )
+                                            }
+                                        }
+                                    },
+                                )
+                                mainHandler.post {
+                                    result.success(
+                                        mapOf(
+                                            "lufs" to analyzed.lufs,
+                                            "sampleRate" to analyzed.sampleRate,
+                                            "analyzedMs" to analyzed.analyzedMs
+                                        )
+                                    )
+                                }
+                            } catch (e: Exception) {
+                                mainHandler.post {
+                                    if (loudnessAnalysisCancelled) {
+                                        // 取消不算失败,返回 success(false) 让 Dart 侧
+                                        // 走"已丢弃"路径(序号守卫也会拦截)。
+                                        result.success(null)
+                                    } else {
+                                        result.error("analyze_failed", e.message, null)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "cancelLoudnessAnalysis" -> {
+                        // 切歌时调用,让正在跑的解码循环立即结束。
+                        Log.i("Loudness", "channel cancelLoudnessAnalysis 取消在途分析")
+                        loudnessAnalysisCancelled = true
+                        result.success(true)
+                    }
+                    "configureLoudnessGain" -> {
+                        val audioSessionId = call.argument<Int>("audioSessionId")
+                        val enabled = call.argument<Boolean>("enabled") ?: false
+                        val gainMb = call.argument<Int>("gainMb") ?: 0
+                        Log.i("Loudness", "channel configureLoudnessGain enabled=$enabled gainMb=$gainMb session=$audioSessionId")
+
+                        runCatching {
+                            configureLoudnessGain(audioSessionId, enabled, gainMb)
+                        }.onSuccess { supported ->
+                            Log.i("Loudness", "configureLoudnessGain 成功 supported=$supported gainMb=$gainMb")
+                            result.success(supported)
+                        }.onFailure { error ->
+                            Log.e("Loudness", "configureLoudnessGain 失败 gainMb=$gainMb", error)
+                            releaseLoudnessGain()
+                            result.error("loudness_gain_failed", error.message, null)
+                        }
+                    }
+                    "releaseLoudnessGain" -> {
+                        releaseLoudnessGain()
+                        result.success(true)
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "shiyin_music/local_music")
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "hasPermission" -> {
+                        result.success(hasReadAudioPermission())
+                    }
+                    "requestPermission" -> {
+                        if (hasReadAudioPermission()) {
+                            result.success(true)
+                        } else {
+                            pendingPermissionResult = result
+                            requestAudioPermission()
+                        }
+                    }
+                    "getLocalSongs" -> {
+                        if (!hasReadAudioPermission()) {
+                            result.error("no_permission", "READ_MEDIA_AUDIO permission not granted", null)
+                            return@setMethodCallHandler
+                        }
+                        runCatching {
+                            queryLocalSongs()
+                        }.onSuccess { songs ->
+                            result.success(songs)
+                        }.onFailure { error ->
+                            result.error("query_failed", error.message, null)
+                        }
+                    }
+                    "getAlbumArt" -> {
+                        val albumId = call.argument<Number>("albumId")?.toLong()
+                        if (albumId == null || albumId <= 0) {
+                            result.success(null)
+                            return@setMethodCallHandler
+                        }
+                        runCatching {
+                            getAlbumArtBytes(albumId)
+                        }.onSuccess { bytes ->
+                            result.success(bytes)
+                        }.onFailure { error ->
+                            result.error("album_art_failed", error.message, null)
+                        }
+                    }
+                    "getEmbeddedLyrics" -> {
+                        val filePath = call.argument<String>("filePath")
+                        if (filePath.isNullOrEmpty()) {
+                            result.success(null)
+                            return@setMethodCallHandler
+                        }
+                        runCatching {
+                            getEmbeddedLyrics(filePath)
+                        }.onSuccess { lyrics ->
+                            result.success(lyrics)
+                        }.onFailure { error ->
+                            result.error("lyrics_failed", error.message, null)
+                        }
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+
+        desktopLyricsChannel = MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            "shiyin_music/desktop_lyrics"
+        )
+        registerLyricsStateReceiver()
+        desktopLyricsChannel?.setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "checkPermission" -> {
+                        result.success(Settings.canDrawOverlays(this))
+                    }
+                    "requestPermission" -> {
+                        val intent = Intent(
+                            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                            Uri.parse("package:$packageName")
+                        )
+                        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        startActivity(intent)
+                        result.success(null)
+                    }
+                    "show" -> {
+                        if (!Settings.canDrawOverlays(this)) {
+                            result.error("no_permission", "No overlay permission", null)
+                            return@setMethodCallHandler
+                        }
+                        val title = call.argument<String>("title") ?: ""
+                        val artist = call.argument<String>("artist") ?: ""
+                        // 新版 Flutter 的 show 请求自带当前歌词内容：新建窗口
+                        // 立刻上屏，不依赖紧随其后的 updateLyrics（那一次推送
+                        // 可能被服务 stop/start 竞态吞掉，伴奏期没有后续推送
+                        // 兜底，窗口会空到下一句）。
+                        // 读值而非判存在：Dart 恒发 true，当前等价；判存在的
+                        // 写法会让将来的 lyricPayload=false 被误当成 true，
+                        // 空歌词不再回退到服务内缓存。
+                        val hasLyricPayload = call.argument<Boolean>("lyricPayload") ?: false
+                        val current = call.argument<String>("current") ?: ""
+                        val next = call.argument<String>("next") ?: ""
+                        val intent = Intent(this, LyricsOverlayService::class.java).apply {
+                            action = LyricsOverlayService.ACTION_UPDATE_LYRICS
+                            putExtra(LyricsOverlayService.EXTRA_TITLE, title)
+                            putExtra(LyricsOverlayService.EXTRA_ARTIST, artist)
+                            putExtra(LyricsOverlayService.EXTRA_CURRENT_LYRIC, current)
+                            putExtra(LyricsOverlayService.EXTRA_NEXT_LYRIC, next)
+                            putExtra(
+                                LyricsOverlayService.EXTRA_LYRIC_PAYLOAD,
+                                hasLyricPayload
+                            )
+                        }
+                        startLyricsService(intent)
+                        result.success(null)
+                    }
+                    "hide" -> {
+                        // transient=true：切前台等临时隐藏，原生保留自愈标记与
+                        // 缓存歌词；false（关开关/无歌/退出）则彻底清除不复活。
+                        val transient = call.argument<Boolean>("transient") ?: false
+                        val intent = Intent(this, LyricsOverlayService::class.java).apply {
+                            action = LyricsOverlayService.ACTION_HIDE
+                            putExtra(LyricsOverlayService.EXTRA_TRANSIENT_HIDE, transient)
+                        }
+                        startLyricsService(intent)
+                        result.success(null)
+                    }
+                    "updateLyrics" -> {
+                        val current = call.argument<String>("current") ?: ""
+                        val next = call.argument<String>("next") ?: ""
+                        val intent = Intent(this, LyricsOverlayService::class.java).apply {
+                            action = LyricsOverlayService.ACTION_UPDATE_LYRICS
+                            putExtra(LyricsOverlayService.EXTRA_CURRENT_LYRIC, current)
+                            putExtra(LyricsOverlayService.EXTRA_NEXT_LYRIC, next)
+                        }
+                        startLyricsService(intent)
+                        result.success(null)
+                    }
+                    "cacheLyrics" -> {
+                        // 只缓存不建窗：App 在前台时悬浮窗必须保持隐藏，但原生
+                        // 侧回桌面自愈重建要用的歌词缓存需持续跟随播放。
+                        val current = call.argument<String>("current") ?: ""
+                        val next = call.argument<String>("next") ?: ""
+                        val intent = Intent(this, LyricsOverlayService::class.java).apply {
+                            action = LyricsOverlayService.ACTION_CACHE_LYRICS
+                            putExtra(LyricsOverlayService.EXTRA_CURRENT_LYRIC, current)
+                            putExtra(LyricsOverlayService.EXTRA_NEXT_LYRIC, next)
+                        }
+                        startLyricsService(intent)
+                        result.success(null)
+                    }
+                    "updatePlayState" -> {
+                        val isPlaying = call.argument<Boolean>("isPlaying") ?: false
+                        val intent = Intent(this, LyricsOverlayService::class.java).apply {
+                            action = LyricsOverlayService.ACTION_UPDATE_PLAY_STATE
+                            putExtra(LyricsOverlayService.EXTRA_IS_PLAYING, isPlaying)
+                        }
+                        startLyricsService(intent)
+                        result.success(null)
+                    }
+                    "isVisible" -> {
+                        // 真实展示态：服务实例在"App 前台 + 歌词开启"期间是常驻的
+                        // （前台隐藏期保活），用服务存活判断会把"没窗"报成可见。
+                        result.success(LyricsOverlayService.overlayVisible)
+                    }
+                    "updateKaraokeProgress" -> {
+                        val progress = call.argument<Double>("progress")?.toFloat() ?: 0f
+                        // 与颜色键同理按 Number 读（StandardMessageCodec 对
+                        // < 2^31 的整数编成 Int），编解码收口保持一致。
+                        val lineDurationMs =
+                            call.argument<Number>("lineDurationMs")?.toInt() ?: 0
+                        val isPlaying = call.argument<Boolean>("isPlaying") ?: false
+                        val intent = Intent(this, LyricsOverlayService::class.java).apply {
+                            action = LyricsOverlayService.ACTION_UPDATE_KARAOKE
+                            putExtra(LyricsOverlayService.EXTRA_PROGRESS, progress)
+                            putExtra(LyricsOverlayService.EXTRA_LINE_DURATION_MS, lineDurationMs)
+                            putExtra(LyricsOverlayService.EXTRA_IS_PLAYING, isPlaying)
+                        }
+                        startLyricsService(intent)
+                        result.success(null)
+                    }
+                    "updateSettings" -> {
+                        // 缺键回退与 Flutter 侧 DesktopLyricsSettings 移动端默认对齐
+                        //（双行、50% 背景、字号 24、金黄/天蓝双色）；正常流程
+                        // Flutter 恒传显式值。
+                        val opacity = call.argument<Double>("opacity")?.toFloat() ?: 0.5f
+                        val locked = call.argument<Boolean>("locked") ?: false
+                        val passthrough = call.argument<Boolean>("passthrough") ?: false
+                        // 旧版 Flutter 只发 textColor（= 未播放色），新版发双色键；
+                        // 缺键时用旧键回退，保证升级前后外观一致。
+                        // 颜色统一按 Number 读：StandardMessageCodec 对 < 2^31 的
+                        // 整数编成 Int、否则编成 Long，只按 Long 读会让低 alpha
+                        // 颜色静默回退成白色。
+                        val legacyTextColor = call.argument<Number>("textColor")?.toLong()
+                        val unplayedColorLong = call.argument<Number>("unplayedTextColor")
+                            ?.toLong() ?: legacyTextColor ?: 0xFF00BFFFL
+                        val playedColorLong = call.argument<Number>("playedTextColor")
+                            ?.toLong() ?: legacyTextColor ?: 0xFFFFD700L
+                        val backgroundColorLong = call.argument<Number>("backgroundColor")
+                            ?.toLong() ?: 0xFF1A1A2EL
+                        val fontSize = call.argument<Double>("fontSize")?.toFloat() ?: 24f
+                        val textOpacity = call.argument<Double>("textOpacity")?.toFloat() ?: 1f
+                        val singleLine = call.argument<Boolean>("singleLine") ?: false
+                        // 对齐：left/center/right；旧版 Flutter 未发该键时按历史
+                        // 左对齐兜底（收到 split 时服务侧同样归一化为 left）。
+                        val alignment = call.argument<String>("alignment") ?: "left"
+                        val intent = Intent(this, LyricsOverlayService::class.java).apply {
+                            action = LyricsOverlayService.ACTION_UPDATE_SETTINGS
+                            putExtra(LyricsOverlayService.EXTRA_OPACITY, opacity)
+                            putExtra(LyricsOverlayService.EXTRA_LOCKED, locked)
+                            putExtra(LyricsOverlayService.EXTRA_PASSTHROUGH, passthrough)
+                            putExtra(LyricsOverlayService.EXTRA_TEXT_COLOR, unplayedColorLong.toInt())
+                            putExtra(LyricsOverlayService.EXTRA_UNPLAYED_TEXT_COLOR, unplayedColorLong.toInt())
+                            putExtra(LyricsOverlayService.EXTRA_PLAYED_TEXT_COLOR, playedColorLong.toInt())
+                            putExtra(LyricsOverlayService.EXTRA_TEXT_OPACITY, textOpacity)
+                            putExtra(LyricsOverlayService.EXTRA_SINGLE_LINE, singleLine)
+                            putExtra(LyricsOverlayService.EXTRA_ALIGNMENT, alignment)
+                            putExtra(LyricsOverlayService.EXTRA_BACKGROUND_COLOR, backgroundColorLong.toInt())
+                            putExtra(LyricsOverlayService.EXTRA_FONT_SIZE, fontSize)
+                        }
+                        startLyricsService(intent)
+                        result.success(null)
+                    }
+                    "setAppForeground" -> {
+                        val isForeground = call.argument<Boolean>("isForeground") ?: false
+                        val intent = Intent(this, LyricsOverlayService::class.java).apply {
+                            action = LyricsOverlayService.ACTION_SET_APP_FOREGROUND
+                            putExtra(LyricsOverlayService.EXTRA_IS_FOREGROUND, isForeground)
+                        }
+                        startLyricsService(intent)
+                        result.success(null)
+                    }
+                    // 通知卡片自定义按钮（桌面歌词开关等）在应用后台时触发，
+                    // Flutter 侧的应用内 Toast 不可见，只能走原生 Toast 提示。
+                    "showToast" -> {
+                        val message = call.argument<String>("message") ?: ""
+                        Log.d("SYNOTIF", "showToast: $message")
+                        if (message.isNotEmpty()) {
+                            runCatching {
+                                Toast.makeText(
+                                    applicationContext,
+                                    message,
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            }
+                        }
+                        result.success(null)
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+
+        vivoLyricsChannel = VivoLyricsBridge.register(
+            flutterEngine.dartExecutor.binaryMessenger,
+        )
+
+        // SuperLyric 系统歌词发布（Xposed）
+        superLyricChannel = MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            "shiyin_music/super_lyric"
+        )
+        superLyricChannel?.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "isAvailable" -> {
+                    runCatching {
+                        SuperLyricHelper.isAvailable()
+                    }.onSuccess { available ->
+                        result.success(available)
+                    }.onFailure { error ->
+                        Log.w(TAG_SUPER_LYRIC, "isAvailable failed: ${error.message}")
+                        result.success(false)
+                    }
+                }
+                "registerPublisher" -> {
+                    runCatching {
+                        if (!superLyricRegistered) {
+                            SuperLyricHelper.registerPublisher()
+                            superLyricRegistered = true
+                        }
+                        val registered = runCatching {
+                            SuperLyricHelper.isPublisherRegistered()
+                        }.getOrNull() ?: superLyricRegistered
+                        Log.d(TAG_SUPER_LYRIC, "registerPublisher: registered=$registered")
+                        result.success(registered)
+                    }.onFailure { error ->
+                        Log.w(TAG_SUPER_LYRIC, "registerPublisher failed: ${error.message}")
+                        result.success(false)
+                    }
+                }
+                "unregisterPublisher" -> {
+                    runCatching {
+                        if (superLyricRegistered) {
+                            SuperLyricHelper.unregisterPublisher()
+                            superLyricRegistered = false
+                        }
+                        result.success(null)
+                    }.onFailure {
+                        result.success(null)
+                    }
+                }
+                "sendLyric" -> {
+                    runCatching {
+                        if (!superLyricRegistered) {
+                            SuperLyricHelper.registerPublisher()
+                            superLyricRegistered = true
+                        }
+                        val title = call.argument<String>("title") ?: ""
+                        val artist = call.argument<String>("artist") ?: ""
+                        val album = call.argument<String>("album") ?: ""
+                        val lyricText = call.argument<String>("lyricText") ?: ""
+                        val lyricStartTime =
+                            (call.argument<Number>("lyricStartTime"))?.toLong() ?: 0L
+                        val lyricEndTime =
+                            (call.argument<Number>("lyricEndTime"))?.toLong() ?: 0L
+                        val secondaryText = call.argument<String>("secondaryText")
+                        val translationText = call.argument<String>("translationText")
+                        val words = call.argument<List<Map<String, Any>>>("words")
+
+                        val lyricData = SuperLyricData()
+                            .setTitle(title)
+                            .setArtist(artist)
+                            .setAlbum(album)
+
+                        val lyricWords: Array<SuperLyricWord>? = words?.mapNotNull { w ->
+                            val wordText = w["word"] as? String
+                            val wordStart = (w["startTime"] as? Number)?.toLong()
+                            val wordEnd = (w["endTime"] as? Number)?.toLong()
+                            if (wordText != null && wordStart != null && wordEnd != null) {
+                                SuperLyricWord(wordText, wordStart, wordEnd)
+                            } else null
+                        }?.takeIf { it.isNotEmpty() }?.toTypedArray()
+
+                        val mainLyric = if (lyricWords != null) {
+                            SuperLyricLine(lyricText, lyricWords, lyricStartTime, lyricEndTime)
+                        } else {
+                            SuperLyricLine(lyricText, lyricStartTime, lyricEndTime)
+                        }
+                        lyricData.setLyric(mainLyric)
+
+                        if (!secondaryText.isNullOrBlank()) {
+                            lyricData.setSecondary(
+                                SuperLyricLine(secondaryText, lyricStartTime, lyricEndTime)
+                            )
+                        }
+                        if (!translationText.isNullOrBlank()) {
+                            lyricData.setTranslation(
+                                SuperLyricLine(translationText, lyricStartTime, lyricEndTime)
+                            )
+                        }
+                        SuperLyricHelper.sendLyric(lyricData)
+                        Log.d(
+                            TAG_SUPER_LYRIC,
+                            "sendLyric ok: \"$lyricText\" ($lyricStartTime-$lyricEndTime ms), words=${lyricWords?.size ?: 0}"
+                        )
+                        result.success(true)
+                    }.onFailure { error ->
+                        Log.w(TAG_SUPER_LYRIC, "sendLyric failed: ${error.message}")
+                        result.error("send_lyric_failed", error.message, null)
+                    }
+                }
+                "sendStop" -> {
+                    runCatching {
+                        if (!superLyricRegistered) {
+                            SuperLyricHelper.registerPublisher()
+                            superLyricRegistered = true
+                        }
+                        SuperLyricHelper.sendStop(SuperLyricData())
+                        Log.d(TAG_SUPER_LYRIC, "sendStop ok")
+                        result.success(true)
+                    }.onFailure { error ->
+                        Log.w(TAG_SUPER_LYRIC, "sendStop failed: ${error.message}")
+                        result.error("send_stop_failed", error.message, null)
+                    }
+                }
+                "debugState" -> {
+                    result.success(
+                        mapOf(
+                            "serviceAvailable" to
+                                (runCatching { SuperLyricHelper.isAvailable() }.getOrNull() ?: false),
+                            "localRegisteredFlag" to superLyricRegistered,
+                            "publisherRegistered" to
+                                (runCatching { SuperLyricHelper.isPublisherRegistered() }
+                                    .getOrNull() ?: false),
+                        )
+                    )
+                }
+                else -> result.notImplemented()
+            }
+        }
+
+        // 车载蓝牙歌词广播（标准 + 厂商兼容）
+        val btLyricChannel = MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            "shiyin_music/bluetooth_lyrics"
+        )
+        btLyricChannel.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "broadcastMetaChanged" -> {
+                    runCatching {
+                        val title = call.argument<String>("title") ?: ""
+                        val artist = call.argument<String>("artist") ?: ""
+                        val album = call.argument<String>("album") ?: ""
+                        val lyric = call.argument<String>("lyric") ?: ""
+                        // 整首标准 LRC（issue #22）：车机端按 position 自行
+                        // 滚动高亮需要全量时间轴；只有单行文本时车机端既滚
+                        // 不动，也容易把纯文本当 LRC 解析失败而渲染乱码。
+                        // 空串省略该字段，保持与旧车机端 App 的兼容。
+                        val fullLyric = call.argument<String>("fullLyric") ?: ""
+                        val positionMs = (call.argument<Number>("positionMs") ?: 0).toLong()
+                        val durationMs = (call.argument<Number>("durationMs") ?: 0).toLong()
+                        val playing = call.argument<Boolean>("playing") ?: false
+                        val track = (call.argument<Number>("track") ?: 0).toInt()
+                        val listSize = (call.argument<Number>("listSize") ?: 0).toInt()
+
+                        val extras = Bundle().apply {
+                            putString("track", title)
+                            putString("artist", artist)
+                            putString("album", album)
+                            putString("id", "")
+                            putLong("position", positionMs)
+                            putLong("duration", durationMs)
+                            putBoolean("playing", playing)
+                            putInt("ListSize", listSize)
+                            putInt("trackPos", track)
+                            putString("lyric", lyric)
+                            putString("currentLyric", lyric)
+                            putString("DISPLAY_NAME", title)
+                            if (fullLyric.isNotEmpty()) {
+                                putString("full_lrc", fullLyric)
+                                putString("fullLyric", fullLyric)
+                                putString(
+                                    "org.akanework.lyricinfo.FULL_LYRICS",
+                                    fullLyric,
+                                )
+                            }
+                        }
+
+                        sendOrderedBroadcast(Intent("com.android.music.metachanged").apply {
+                            putExtras(extras)
+                            setPackage(null)
+                        }, null)
+                        sendBroadcast(Intent("com.netease.cloudmusic.metachanged").apply {
+                            putExtras(Bundle(extras))
+                            setPackage(null)
+                        })
+                        sendBroadcast(Intent("com.tencent.qqmusic.metachanged").apply {
+                            putExtras(Bundle(extras))
+                            setPackage(null)
+                        })
+                        sendBroadcast(Intent("com.kugou.android.metachanged").apply {
+                            putExtras(Bundle(extras))
+                            setPackage(null)
+                        })
+                        sendBroadcast(Intent("cn.kuwo.player.metachanged").apply {
+                            putExtras(Bundle(extras))
+                            setPackage(null)
+                        })
+
+                        Log.d(
+                            TAG_BLUETOOTH_LYRICS,
+                            "metaChanged ok: \"$title\"/\"$artist\", lyric=\"${lyric.take(24)}\", pos=${positionMs}ms, fullLrcLen=${fullLyric.length}"
+                        )
+                        result.success(true)
+                    }.onFailure { error ->
+                        Log.w(TAG_BLUETOOTH_LYRICS, "broadcastMetaChanged failed: ${error.message}")
+                        result.success(false)
+                    }
+                }
+                "broadcastPlayStateChanged" -> {
+                    runCatching {
+                        val title = call.argument<String>("title") ?: ""
+                        val artist = call.argument<String>("artist") ?: ""
+                        val album = call.argument<String>("album") ?: ""
+                        val positionMs = (call.argument<Number>("positionMs") ?: 0).toLong()
+                        val durationMs = (call.argument<Number>("durationMs") ?: 0).toLong()
+                        val playing = call.argument<Boolean>("playing") ?: false
+
+                        val extras = Bundle().apply {
+                            putString("track", title)
+                            putString("artist", artist)
+                            putString("album", album)
+                            putLong("position", positionMs)
+                            putLong("duration", durationMs)
+                            putBoolean("playing", playing)
+                        }
+                        sendBroadcast(Intent("com.android.music.playstatechanged").apply {
+                            putExtras(extras)
+                            setPackage(null)
+                        })
+                        sendBroadcast(Intent("com.netease.cloudmusic.playstatechanged").apply {
+                            putExtras(Bundle(extras))
+                            setPackage(null)
+                        })
+                        sendBroadcast(Intent("com.tencent.qqmusic.playstatechanged").apply {
+                            putExtras(Bundle(extras))
+                            setPackage(null)
+                        })
+                        Log.d(
+                            TAG_BLUETOOTH_LYRICS,
+                            "playStateChanged ok: \"$title\", playing=$playing, pos=${positionMs}ms"
+                        )
+                        result.success(true)
+                    }.onFailure { error ->
+                        Log.w(TAG_BLUETOOTH_LYRICS, "broadcastPlayStateChanged failed: ${error.message}")
+                        result.success(false)
+                    }
+                }
+                else -> result.notImplemented()
+            }
+        }
+
+        // 听歌识曲麦克风采集(PCM 8000Hz/16bit/单声道,见 AudioCaptureHandler)
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "shiyin_music/audio_capture")
+            .setMethodCallHandler { call, result ->
+                AudioCaptureHandler.handle(call, result, this)
+            }
+
+        // 自定义下载目录：file_picker 选目录只返回路径、不携带 SAF 授权，
+        // 系统公共文件夹的按路径写入依赖「所有文件访问」（MANAGE_EXTERNAL_STORAGE）。
+        // 该通道只做权限状态查询与申请；未授权时 Dart 侧回退应用专属目录。
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "shiyin_music/storage")
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "getStatus" -> result.success(storageAccessStatus())
+                    "requestAccess" -> requestStorageAccess(result)
+                    "scanFile" -> {
+                        // 下载到公共目录的文件不会自动进系统媒体库：主动扫描
+                        // 后车机/其他播放器/相册才看得到（应用专属目录会被
+                        // 系统忽略，调用无副作用）。
+                        val path = call.argument<String>("path")
+                        if (path.isNullOrEmpty()) {
+                            result.success(false)
+                            return@setMethodCallHandler
+                        }
+                        val ok = runCatching {
+                            MediaScannerConnection.scanFile(this, arrayOf(path), null, null)
+                        }.isSuccess
+                        result.success(ok)
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+    }
+
+    /**
+     * 车机方控兜底：先让 [CarMediaKeyHandler] 识别标准媒体键并消费，
+     * 其余按键原样交回 Flutter/系统（返回键、输入法等不受影响）。
+     */
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (carMediaKeyHandler?.handleKeyEvent(event.keyCode, event) == true) {
+            return true
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
+    private fun readAudioPermission(): String {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            Manifest.permission.READ_MEDIA_AUDIO
+        } else {
+            Manifest.permission.READ_EXTERNAL_STORAGE
+        }
+    }
+
+    private fun hasReadAudioPermission(): Boolean {
+        return ContextCompat.checkSelfPermission(this, readAudioPermission()) ==
+                PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun requestAudioPermission() {
+        ActivityCompat.requestPermissions(
+            this,
+            arrayOf(readAudioPermission()),
+            REQUEST_READ_AUDIO
+        )
+    }
+
+    /**
+     * 「所有文件访问」（MANAGE_EXTERNAL_STORAGE）是否已授予；API 29 及以下
+     * 没有该权限，恒为 false（Android 10 会走「不支持」提示，9 及以下走
+     * WRITE_EXTERNAL_STORAGE 的 granted 分支）。
+     *
+     * 单独成函数是为了让 lint 能识别 `SDK_INT >= R` 的版本门控（NewApi）。
+     */
+    private fun hasAllFilesAccess(): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            Environment.isExternalStorageManager()
+        } else {
+            false
+        }
+    }
+
+    /**
+     * 当前存储访问状态：Android 11+ 看「所有文件访问」，Android 9 及以下看
+     * WRITE_EXTERNAL_STORAGE；Android 10 强制分区存储且没有对应开关，
+     * granted / canRequest 均为 false，Dart 侧据此提示不支持公共目录。
+     */
+    private fun storageAccessStatus(): Map<String, Any> {
+        val sdk = Build.VERSION.SDK_INT
+        val granted = when {
+            sdk >= Build.VERSION_CODES.R -> hasAllFilesAccess()
+            sdk >= Build.VERSION_CODES.Q -> false
+            else -> ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.WRITE_EXTERNAL_STORAGE
+            ) == PackageManager.PERMISSION_GRANTED
+        }
+        // Android 10（API 29）没有任何可申请的公共目录写权限。
+        val canRequest = sdk >= Build.VERSION_CODES.R || sdk < Build.VERSION_CODES.Q
+        return mapOf<String, Any>(
+            "sdkInt" to sdk,
+            "granted" to granted,
+            "canRequest" to canRequest
+        )
+    }
+
+    private fun requestStorageAccess(result: MethodChannel.Result) {
+        val sdk = Build.VERSION.SDK_INT
+        if (storageAccessStatus()["granted"] == true) {
+            result.success(true)
+            return
+        }
+        // 上一次申请还没返回（用户没退出设置页就又点了一次）：先按未授权
+        // 结束旧回调，避免 Dart 侧 future 悬挂、也避免回调被覆盖后泄漏。
+        pendingStorageResult?.success(false)
+        pendingStorageResult = null
+        when {
+            sdk >= Build.VERSION_CODES.R -> {
+                pendingStorageResult = result
+                val appIntent = Intent(
+                    Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                    Uri.parse("package:$packageName")
+                )
+                val appLaunched = runCatching {
+                    startActivityForResult(appIntent, REQUEST_ALL_FILES_ACCESS)
+                }.isSuccess
+                if (!appLaunched) {
+                    // 部分 ROM 没有应用级开关入口，退回「所有文件访问」列表页。
+                    val listIntent =
+                        Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                    val listLaunched = runCatching {
+                        startActivityForResult(listIntent, REQUEST_ALL_FILES_ACCESS)
+                    }.isSuccess
+                    if (!listLaunched) {
+                        pendingStorageResult = null
+                        result.success(false)
+                    }
+                }
+            }
+            sdk < Build.VERSION_CODES.Q -> {
+                pendingStorageResult = result
+                ActivityCompat.requestPermissions(
+                    this,
+                    arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE),
+                    REQUEST_WRITE_STORAGE
+                )
+            }
+            else -> result.success(false)
+        }
+    }
+
+    // 「所有文件访问」设置页没有可用的 resultCode（用户可能直接返回），
+    // 回来后以系统真实授权状态为准。
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQUEST_ALL_FILES_ACCESS) {
+            val pending = pendingStorageResult
+            pendingStorageResult = null
+            pending?.success(hasAllFilesAccess())
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_READ_AUDIO) {
+            val granted = grantResults.isNotEmpty() &&
+                    grantResults[0] == PackageManager.PERMISSION_GRANTED
+            pendingPermissionResult?.success(granted)
+            pendingPermissionResult = null
+        }
+        if (requestCode == REQUEST_WRITE_STORAGE) {
+            val granted = grantResults.isNotEmpty() &&
+                    grantResults[0] == PackageManager.PERMISSION_GRANTED
+            pendingStorageResult?.success(granted)
+            pendingStorageResult = null
+        }
+        AudioCaptureHandler.onRequestPermissionsResult(requestCode, grantResults)
+    }
+
+    private fun queryLocalSongs(): List<Map<String, Any?>> {
+        val songs = mutableListOf<Map<String, Any?>>()
+
+        val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
+        } else {
+            MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+        }
+
+        val projection = arrayOf(
+            MediaStore.Audio.Media._ID,
+            MediaStore.Audio.Media.TITLE,
+            MediaStore.Audio.Media.ARTIST,
+            MediaStore.Audio.Media.ALBUM,
+            MediaStore.Audio.Media.DURATION,
+            MediaStore.Audio.Media.DATA,
+            MediaStore.Audio.Media.ALBUM_ID,
+            MediaStore.Audio.Media.IS_MUSIC,
+        )
+
+        val selection = "${MediaStore.Audio.Media.IS_MUSIC} != 0"
+        val sortOrder = "${MediaStore.Audio.Media.DATE_ADDED} DESC"
+
+        var cursor: Cursor? = null
+        try {
+            cursor = contentResolver.query(
+                collection,
+                projection,
+                selection,
+                null,
+                sortOrder
+            )
+
+            cursor?.let {
+                val idColumn = it.getColumnIndexOrThrow(MediaStore.Audio.Media._ID)
+                val titleColumn = it.getColumnIndexOrThrow(MediaStore.Audio.Media.TITLE)
+                val artistColumn = it.getColumnIndexOrThrow(MediaStore.Audio.Media.ARTIST)
+                val albumColumn = it.getColumnIndexOrThrow(MediaStore.Audio.Media.ALBUM)
+                val durationColumn = it.getColumnIndexOrThrow(MediaStore.Audio.Media.DURATION)
+                val dataColumn = it.getColumnIndexOrThrow(MediaStore.Audio.Media.DATA)
+                val albumIdColumn = it.getColumnIndexOrThrow(MediaStore.Audio.Media.ALBUM_ID)
+
+                while (it.moveToNext()) {
+                    val id = it.getLong(idColumn)
+                    val title = it.getString(titleColumn) ?: "未知歌曲"
+                    val artist = it.getString(artistColumn) ?: "未知艺人"
+                    val album = it.getString(albumColumn) ?: ""
+                    val duration = it.getLong(durationColumn)
+                    val filePath = it.getString(dataColumn) ?: ""
+                    val albumId = it.getLong(albumIdColumn)
+
+                    // 构建专辑封面 URI
+                    val albumArtUri = ContentUris.withAppendedId(
+                        Uri.parse("content://media/external/audio/albumart"),
+                        albumId
+                    )
+
+                    if (filePath.isNotEmpty()) {
+                        songs.add(
+                            mapOf(
+                                "id" to filePath,
+                                "title" to title,
+                                "artist" to artist,
+                                "album" to album,
+                                "duration" to duration,
+                                "filePath" to filePath,
+                                "albumArtUri" to albumArtUri.toString(),
+                            )
+                        )
+                    }
+                }
+            }
+        } finally {
+            cursor?.close()
+        }
+
+        return songs
+    }
+
+    private fun registerLyricsStateReceiver() {
+        if (lyricsStateReceiverRegistered) {
+            return
+        }
+        val filter = IntentFilter(LyricsOverlayService.ACTION_VISIBILITY_CHANGED)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(lyricsStateReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(lyricsStateReceiver, filter)
+        }
+        lyricsStateReceiverRegistered = true
+    }
+
+    private fun equalizerConfig(audioSessionId: Int?): Map<String, Any>? {
+        if (audioSessionId == null || audioSessionId <= 0) {
+            return null
+        }
+        val effect = ensureEqualizer(audioSessionId)
+        val range = effect.bandLevelRange
+        val bands = (0 until effect.numberOfBands).map { index ->
+            val band = index.toShort()
+            mapOf(
+                "centerHz" to effect.getCenterFreq(band) / 1000,
+                "level" to effect.getBandLevel(band).toInt()
+            )
+        }
+        return mapOf(
+            "range" to listOf(range[0].toInt(), range[1].toInt()),
+            "bands" to bands
+        )
+    }
+
+    private fun configureEqualizer(
+        audioSessionId: Int?,
+        enabled: Boolean,
+        levels: List<Int>
+    ): Boolean {
+        if (!enabled) {
+            releaseEqualizer()
+            return true
+        }
+        if (audioSessionId == null || audioSessionId <= 0) {
+            return false
+        }
+
+        val effect = ensureEqualizer(audioSessionId)
+        val range = effect.bandLevelRange
+        val bandCount = minOf(effect.numberOfBands.toInt(), levels.size)
+        for (index in 0 until bandCount) {
+            val level = levels[index].coerceIn(range[0].toInt(), range[1].toInt())
+            effect.setBandLevel(index.toShort(), level.toShort())
+        }
+        effect.enabled = true
+        return true
+    }
+
+    private fun ensureEqualizer(audioSessionId: Int): Equalizer {
+        if (equalizerSessionId == audioSessionId && equalizer != null) {
+            return equalizer!!
+        }
+        releaseEqualizer()
+        return Equalizer(0, audioSessionId).also {
+            equalizer = it
+            equalizerSessionId = audioSessionId
+        }
+    }
+
+    private fun releaseEqualizer() {
+        equalizer?.runCatching {
+            enabled = false
+            release()
+        }
+        equalizer = null
+        equalizerSessionId = null
+    }
+
+    private fun configureBassBoost(
+        audioSessionId: Int?,
+        enabled: Boolean,
+        strength: Int
+    ): Boolean {
+        if (!enabled) {
+            releaseBassBoost()
+            return true
+        }
+        if (audioSessionId == null || audioSessionId <= 0) {
+            return false
+        }
+
+        val effect = if (bassBoostSessionId == audioSessionId && bassBoost != null) {
+            bassBoost!!
+        } else {
+            releaseBassBoost()
+            BassBoost(0, audioSessionId).also {
+                bassBoost = it
+                bassBoostSessionId = audioSessionId
+            }
+        }
+
+        val clampedStrength = strength.coerceIn(0, 1000).toShort()
+        if (effect.strengthSupported) {
+            effect.setStrength(clampedStrength)
+        } else {
+            effect.setStrength(if (clampedStrength > 0) 1000 else 0)
+        }
+        effect.enabled = true
+        return true
+    }
+
+    private fun releaseBassBoost() {
+        bassBoost?.runCatching {
+            enabled = false
+            release()
+        }
+        bassBoost = null
+        bassBoostSessionId = null
+    }
+
+    /**
+     * 配置环绕（Virtualizer）。API 31 起官方标记 deprecated 且推荐 Spatializer，
+     * 但 Spatializer 是系统级查询/控制接口、不能按音频会话插入效果，对本应用
+     * 场景不可用；Virtualizer 在 minSdk 26 全范围仍可工作。部分设备实现为空
+     * 操作，由 strengthSupported 表达，效果差异属设备行为。
+     */
+    @Suppress("DEPRECATION")
+    private fun configureVirtualizer(
+        audioSessionId: Int?,
+        enabled: Boolean,
+        strength: Int
+    ): Boolean {
+        if (!enabled) {
+            releaseVirtualizer()
+            return true
+        }
+        if (audioSessionId == null || audioSessionId <= 0) {
+            return false
+        }
+
+        val effect = if (virtualizerSessionId == audioSessionId && virtualizer != null) {
+            virtualizer!!
+        } else {
+            releaseVirtualizer()
+            Virtualizer(0, audioSessionId).also {
+                virtualizer = it
+                virtualizerSessionId = audioSessionId
+            }
+        }
+
+        val clampedStrength = strength.coerceIn(0, 1000).toShort()
+        if (effect.strengthSupported) {
+            effect.setStrength(clampedStrength)
+        } else {
+            effect.setStrength(if (clampedStrength > 0) 1000 else 0)
+        }
+        effect.enabled = true
+        return true
+    }
+
+    @Suppress("DEPRECATION")
+    private fun releaseVirtualizer() {
+        virtualizer?.runCatching {
+            enabled = false
+            release()
+        }
+        virtualizer = null
+        virtualizerSessionId = null
+    }
+
+    /**
+     * 配置响度增益(基于已分析的 LUFS 差值)。
+     * 使用 Android [LoudnessEnhancer] 仅放大轻歌(增益范围 0~1500 mB);
+     * 响歌衰减由 Dart 侧 [AudioPlayer.setVolume] 完成,LoudnessEnhancer 不支持负增益。
+     * 仿照 [configureBassBoost] 范式:sessionId 不变则复用,否则释放重建。
+     */
+    private fun configureLoudnessGain(
+        audioSessionId: Int?,
+        enabled: Boolean,
+        gainMb: Int
+    ): Boolean {
+        if (!enabled) {
+            releaseLoudnessGain()
+            return true
+        }
+        if (audioSessionId == null || audioSessionId <= 0) {
+            return false
+        }
+
+        val effect = if (loudnessEnhancerSessionId == audioSessionId &&
+            loudnessEnhancer != null
+        ) {
+            loudnessEnhancer!!
+        } else {
+            releaseLoudnessGain()
+            LoudnessEnhancer(audioSessionId).also {
+                loudnessEnhancer = it
+                loudnessEnhancerSessionId = audioSessionId
+            }
+        }
+
+        // LoudnessEnhancer 仅支持正向放大(setTargetGain 文档限定 "amplified"),
+        // 负值衰减属未定义行为,故下限为 0;响歌衰减由 Dart 侧 setVolume 完成。
+        val clampedGain = gainMb.coerceIn(0, 1500)
+        effect.setTargetGain(clampedGain)
+        effect.enabled = true
+        return true
+    }
+
+    private fun releaseLoudnessGain() {
+        loudnessEnhancer?.runCatching {
+            enabled = false
+            release()
+        }
+        loudnessEnhancer = null
+        loudnessEnhancerSessionId = null
+    }
+
+    private fun enqueueApkDownload(url: String, fileName: String) {
+        val request = DownloadManager.Request(Uri.parse(url))
+            .setTitle("时音 更新包")
+            .setDescription("正在下载新版本")
+            .setMimeType("application/vnd.android.package-archive")
+            .setAllowedOverMetered(true)
+            .setAllowedOverRoaming(true)
+            .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+            .setDestinationInExternalFilesDir(this, Environment.DIRECTORY_DOWNLOADS, fileName)
+
+        val downloadManager = getSystemService(DOWNLOAD_SERVICE) as DownloadManager
+        val downloadId = downloadManager.enqueue(request)
+        updateDownloads[downloadId] = fileName
+        registerDownloadReceiver()
+    }
+
+    private fun registerDownloadReceiver() {
+        if (downloadReceiverRegistered) {
+            return
+        }
+        val filter = IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(downloadReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(downloadReceiver, filter)
+        }
+        downloadReceiverRegistered = true
+    }
+
+    private fun isDownloadSuccessful(downloadId: Long): Boolean {
+        val downloadManager = getSystemService(DOWNLOAD_SERVICE) as DownloadManager
+        val query = DownloadManager.Query().setFilterById(downloadId)
+        var cursor: Cursor? = null
+        return try {
+            cursor = downloadManager.query(query)
+            cursor != null &&
+                cursor.moveToFirst() &&
+                cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS)) ==
+                DownloadManager.STATUS_SUCCESSFUL
+        } finally {
+            cursor?.close()
+        }
+    }
+
+    private fun installDownloadedApk(fileName: String) {
+        val apkFile = File(getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), fileName)
+        if (!apkFile.exists()) {
+            return
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+            !packageManager.canRequestPackageInstalls()
+        ) {
+            startActivity(
+                Intent(
+                    Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                    Uri.parse("package:$packageName")
+                ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+            return
+        }
+
+        val apkUri = FileProvider.getUriForFile(
+            this,
+            "$packageName.fileprovider",
+            apkFile
+        )
+        val installIntent = Intent(Intent.ACTION_VIEW)
+            .setDataAndType(apkUri, "application/vnd.android.package-archive")
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        startActivity(installIntent)
+    }
+
+    /// 是否为 Android Automotive 车机设备。
+    /// 仅依赖官方 FEATURE_AUTOMOTIVE 标记：国产定制 AOSP 车机通常未声明，
+    /// 会判为 false，需用户在设置→个性化手动开启车机模式。
+    private fun isAutomotiveDevice(): Boolean {
+        return packageManager.hasSystemFeature(PackageManager.FEATURE_AUTOMOTIVE)
+    }
+
+    private fun getAlbumArtBytes(albumId: Long): ByteArray? {
+        val uri = ContentUris.withAppendedId(
+            Uri.parse("content://media/external/audio/albumart"),
+            albumId
+        )
+        return try {
+            contentResolver.openInputStream(uri)?.use { it.readBytes() }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun getEmbeddedLyrics(filePath: String): String? {
+        return try {
+            val retriever = android.media.MediaMetadataRetriever()
+            retriever.setDataSource(filePath)
+            // METADATA_KEY_LYRICS = 26，API 29+ 才有常量名，直接用数字 key 兼容旧版本
+            val lyrics = retriever.extractMetadata(26)
+            retriever.release()
+            lyrics
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    // singleTop 热启动：Activity 复用，新的 VIEW intent 不再触发
+    // configureFlutterEngine，这里把链接转发给 Dart 侧处理。转发失败（引擎
+    // 已销毁/通道未注册）只记日志，不影响 Activity 生命周期。
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        val data = intent.dataString ?: return
+        if (!data.startsWith(DEEP_LINK_SCHEME)) return
+        runCatching { deepLinkChannel?.invokeMethod("onDeepLink", data) }
+            .onFailure {
+                Log.w(TAG_DEEP_LINK, "DeepLink 转发失败，本次忽略: ${it.message}")
+            }
+    }
+
+    override fun onDestroy() {
+        vivoLyricsChannel?.setMethodCallHandler(null)
+        vivoLyricsChannel = null
+        // 权限申请中的回调：Activity 销毁后 Dart 侧不会再收到结果（界面会
+        // 一直转圈到超时），先按未授权结束；引擎已失效时忽略失败。
+        runCatching { pendingStorageResult?.success(false) }
+        pendingStorageResult = null
+        releaseEqualizer()
+        releaseBassBoost()
+        releaseVirtualizer()
+        releaseLoudnessGain()
+        if (superLyricRegistered) {
+            runCatching { SuperLyricHelper.unregisterPublisher() }
+            superLyricRegistered = false
+        }
+        if (downloadReceiverRegistered) {
+            unregisterReceiver(downloadReceiver)
+            downloadReceiverRegistered = false
+        }
+        if (lyricsStateReceiverRegistered) {
+            unregisterReceiver(lyricsStateReceiver)
+            lyricsStateReceiverRegistered = false
+        }
+        super.onDestroy()
+    }
+}

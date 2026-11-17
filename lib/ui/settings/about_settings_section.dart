@@ -1,0 +1,52 @@
+import 'package:flutter/material.dart';
+
+import '../../services/app_update_service.dart';
+import '../../services/music_api.dart';
+import '../pages/about_page.dart';
+import '../pages/diagnostics_log_page.dart';
+import 'settings_widgets.dart';
+
+/// 设置页「应用」分节。
+class AboutSettingsSection extends StatelessWidget {
+  const AboutSettingsSection({super.key, required this.api});
+
+  final MusicApi api;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const SectionHeader(title: '关于与帮助'),
+        const SizedBox(height: 8),
+        SettingsCard(
+          children: [
+            // 运行日志与诊断：用户侧自助导出/复制日志，反馈问题时可直接附上。
+            SettingsTile(
+              icon: Icons.receipt_long_rounded,
+              iconColor: Theme.of(context).colorScheme.primary,
+              title: '运行日志与诊断',
+              subtitle: '查看、复制与导出诊断日志',
+              onTap: () => Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const DiagnosticsLogPage()),
+              ),
+            ),
+            const SettingsDivider(),
+            SettingsTile(
+              icon: Icons.info_outline_rounded,
+              iconColor: const Color(0xFF607D8B),
+              title: '关于时音',
+              subtitle: AppUpdateService.isSupportedPlatform
+                  ? '版本、更新日志与检查更新'
+                  : '版本与更新日志',
+              onTap: () => Navigator.of(
+                context,
+              ).push(MaterialPageRoute(builder: (_) => AboutPage(api: api))),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+}
