@@ -9,6 +9,8 @@ import '../../controllers/auth_controller.dart';
 import '../../controllers/player_controller.dart';
 import '../../controllers/theme_controller.dart';
 import '../../models/music_models.dart';
+import '../../services/flowing_artwork_palette.dart';
+import '../../widgets/flowing_background.dart';
 import '../desktop/desktop_window_controls.dart';
 import '../form_factor.dart';
 import '../player/landscape_player.dart';
@@ -212,6 +214,7 @@ class _PlayerBodyState extends State<_PlayerBody>
   @override
   void initState() {
     super.initState();
+    ensureFlowingPaletteLoader();
     _dismissAnimation = const AlwaysStoppedAnimation(0.0);
     _dismissController =
         AnimationController(
@@ -338,6 +341,23 @@ class _PlayerBodyState extends State<_PlayerBody>
                       // PageView（allowImplicitScrolling）缓存在树上，不门控
                       // 的话整屏旋转 + sigma24 模糊会继续按刷新率空转。
                       pageVisible: _page == 0 || _pageScrolling,
+                    ),
+                    // Apple Music 流光背景（md3Music 移植）：仅歌词页显示，
+                    // 与模糊封面交叉淡入淡出。TickerMode 门控共享节拍驱动，
+                    // 划回海报页即零帧源；Opacity=0 时跳过绘制。
+                    AnimatedOpacity(
+                      opacity: _lyricPageVisible ? 1.0 : 0.0,
+                      duration: const Duration(milliseconds: 400),
+                      child: TickerMode(
+                        enabled: _lyricPageVisible,
+                        child: Theme(
+                          data: ThemeData(brightness: Brightness.dark),
+                          child: FlowingBackground(
+                            artworkUrl: widget.song.coverUrl,
+                            isPlaying: widget.player.isPlaying,
+                          ),
+                        ),
+                      ),
                     ),
                     SafeArea(
                       // 横屏时同样需要处理顶部状态栏和底部系统导航栏（如车机空调控制栏）的遮挡。

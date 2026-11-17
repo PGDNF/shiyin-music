@@ -8,6 +8,7 @@ import '../../controllers/player_controller.dart';
 import '../../models/music_models.dart';
 import '../form_factor.dart';
 import '../widgets/song_action_sheets.dart' show toggleLikeWithFeedback;
+import 'apple_lyrics_adapter.dart';
 import 'desktop_lyric_list.dart';
 import 'lyric_bottom_bar.dart';
 import 'lyric_display_mode.dart';
@@ -277,11 +278,10 @@ class _LyricPlayerPageState extends State<LyricPlayerPage>
         Expanded(
           child: ExcludeSemantics(
             excluding: isDesktopPlatform,
-            child: MobileLyricList(
+            child: ShiyinAppleLyrics(
               player: widget.player,
               songHash: widget.song.hash,
               lyrics: lyrics,
-              activeIndex: widget.player.activeLyricIndex,
               showTranslation: _showTranslation,
               showRomanization: _showRomanization,
               lyricScale: _lyricScale,

@@ -3,13 +3,11 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
-import 'package:flutter_lyric/flutter_lyric.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../controllers/auth_controller.dart';
 import '../../controllers/player_controller.dart';
 import '../../models/music_models.dart';
-import '../../services/lyric_converter.dart';
 import '../form_factor.dart';
 import '../desktop/desktop_player_bar.dart' hide formatDuration;
 import '../pages/desktop_lyrics_settings_page.dart';
@@ -22,10 +20,10 @@ import '../widgets/playback_speed_sheet.dart';
 import '../widgets/sleep_timer_sheet.dart';
 import '../widgets/song_action_sheets.dart';
 import '../widgets/toast.dart';
+import 'apple_lyrics_adapter.dart';
 import 'desktop_lyric_list.dart';
 import 'lyric_display_mode.dart';
 import 'lyric_offset_sheet.dart';
-import 'lyric_seek_pointer_button.dart';
 import 'lyric_views.dart'
     show kLyricShowRomanizationPrefKey, kLyricShowTranslationPrefKey;
 import 'player_controls.dart';
@@ -789,7 +787,7 @@ class LandscapeLyricPanel extends StatefulWidget {
   final bool compact;
 
   /// 歌词是否显示翻译/音译。桌面分支换算 [LyricDisplayMode]，
-  /// 车机分支透传给 flutter_lyric 模型（两者切换都会触发歌词重建）。
+  /// 手机横屏/车机分支透传给 Apple 动效适配层。
   final bool showTranslation;
   final bool showRomanization;
 
@@ -801,11 +799,6 @@ class LandscapeLyricPanel extends StatefulWidget {
 }
 
 class _LandscapeLyricPanelState extends State<LandscapeLyricPanel> {
-  late final LyricController _lyricController;
-  late final Ticker _ticker;
-  bool _isUserSelecting = false;
-  // 与竖屏 LyricViewport 同理：记录已下发进度，屏蔽冷启动定位起播加载期的回 0 闪动。
-  Duration _lastSentProgress = Duration.zero;
   // 已加载歌词快照：面板自己监听 player，切歌后歌词到达不再依赖父级 rebuild
   // 透传（此前全靠 PlayerPage 顶层 AnimatedBuilder 顺带刷新，一旦复用位置变动
   // 或父级不再重建，就会卡在"正在准备音乐..."）。
@@ -813,26 +806,13 @@ class _LandscapeLyricPanelState extends State<LandscapeLyricPanel> {
   // 准备态快照：歌词为空时 isPreparing 翻转（"正在准备音乐..."→"暂无歌词"）
   // 也要自刷新，否则空歌词歌曲的状态文本不会更新。
   bool _lastPreparing = false;
-  // 歌词进度偏移快照：偏移变更后桌面歌词列表/车机歌词视图都要按新位置重排
-  // （暂停时没有 ticker 帧，不主动补推就会停在旧位置）。
-  Duration _lastLyricOffset = Duration.zero;
 
   @override
   void initState() {
     super.initState();
     _loadedLyrics = widget.lyrics;
     _lastPreparing = widget.player.isPreparing;
-    _lyricController = LyricController();
-    _lyricController.setOnTapLineCallback((position) {
-      _lastSentProgress = position;
-      _lyricController.setProgress(position);
-      widget.player.seekToAndPlay(position);
-    });
-    _lyricController.isSelectingNotifier.addListener(_onSelectingChanged);
     widget.player.addListener(_onPlayerChanged);
-    _syncLyrics();
-    _ticker = Ticker(_onTick);
-    _syncTicker();
   }
 
   @override
@@ -844,33 +824,21 @@ class _LandscapeLyricPanelState extends State<LandscapeLyricPanel> {
       _lastPreparing = widget.player.isPreparing;
     }
     if (oldWidget.songHash != widget.songHash ||
-        oldWidget.showTranslation != widget.showTranslation ||
-        oldWidget.showRomanization != widget.showRomanization ||
         !_sameLyricContent(oldWidget.lyrics, widget.lyrics)) {
       _loadedLyrics = widget.lyrics;
-      _syncLyrics();
     }
-    _syncTicker();
   }
 
   @override
   void dispose() {
     widget.player.removeListener(_onPlayerChanged);
-    _lyricController.isSelectingNotifier.removeListener(_onSelectingChanged);
-    _ticker.dispose();
-    _lyricController.dispose();
     super.dispose();
-  }
-
-  void _onSelectingChanged() {
-    _isUserSelecting = _lyricController.isSelectingNotifier.value;
-    _syncTicker();
   }
 
   /// player 状态变化（切歌清空/歌词到达/准备态翻转）时自刷新，不依赖父级 rebuild。
   ///
   /// 歌词以 player 持有的为准（`loadLyrics` 落定即 `notifyListeners`），快照比对
-  /// 去重后才 `setState`，高频通知只走轻量 `_syncTicker`（启停判断），不开销重建。
+  /// 去重后才 `setState`。进度/偏移刷新由 [ShiyinAppleLyrics] 自行监听 player。
   void _onPlayerChanged() {
     if (!mounted) return;
     final current = widget.player.lyrics;
@@ -879,36 +847,7 @@ class _LandscapeLyricPanelState extends State<LandscapeLyricPanel> {
         preparing != _lastPreparing) {
       _loadedLyrics = current;
       _lastPreparing = preparing;
-      setState(() {
-        _syncLyrics();
-        _syncTicker();
-      });
-      return;
-    }
-    if (widget.player.lyricOffset != _lastLyricOffset) {
-      _lastLyricOffset = widget.player.lyricOffset;
-      final position = widget.player.lyricPosition;
-      _lastSentProgress = position;
-      _lyricController.setProgress(position);
       setState(() {});
-      return;
-    }
-    _syncTicker();
-  }
-
-  void _syncLyrics() {
-    final lyrics = _loadedLyrics;
-    if (lyrics.isNotEmpty) {
-      final model = convertToFlutterLyricModel(
-        lyrics,
-        showTranslation: widget.showTranslation,
-        showRomanization: widget.showRomanization,
-      );
-      _lyricController.loadLyricModel(model);
-      // 重载后立即用当前播放位置校准，避免用陈旧 progress(0) 闪回开头。
-      final current = widget.player.lyricPosition;
-      _lastSentProgress = current;
-      _lyricController.setProgress(current);
     }
   }
 
@@ -921,33 +860,13 @@ class _LandscapeLyricPanelState extends State<LandscapeLyricPanel> {
     return true;
   }
 
-  void _syncTicker() {
-    final shouldTick =
-        widget.player.isPlaying &&
-        _loadedLyrics.isNotEmpty &&
-        !widget.player.isScrubbing &&
-        !_isUserSelecting;
-    if (shouldTick && !_ticker.isActive) {
-      _ticker.start();
-    } else if (!shouldTick && _ticker.isActive) {
-      _ticker.stop();
-    }
-  }
-
-  void _onTick(Duration elapsed) {
-    if (!mounted || widget.player.isScrubbing) {
-      return;
-    }
-    // 车载/分栏歌词按带偏移的歌词位置推进（偏移只作用于歌词）。
-    final pos = widget.player.lyricPosition;
-    if (widget.player.isPreparing &&
-        _lastSentProgress > Duration.zero &&
-        (pos <= Duration.zero ||
-            _lastSentProgress - pos > const Duration(milliseconds: 500))) {
-      return;
-    }
-    _lastSentProgress = pos;
-    _lyricController.setProgress(pos);
+  /// 长按歌词：以面板中心为锚点打开「歌词进度」菜单（车机无鼠标右键语义）。
+  void _openOffsetAtCenter() {
+    final box = context.findRenderObject() as RenderBox?;
+    final anchor = (box == null || !box.hasSize)
+        ? Offset.zero
+        : box.localToGlobal(box.size.center(Offset.zero));
+    widget.onOpenLyricOffset?.call(anchor);
   }
 
   @override
@@ -985,99 +904,23 @@ class _LandscapeLyricPanelState extends State<LandscapeLyricPanel> {
       );
     }
 
-    final fontSize = widget.compact ? 26.0 : 34.0;
-    final inactiveFontSize = widget.compact ? 18.0 : 24.0;
-
-    // 与移动端 MobileLyricList 同一层级策略：用户滚动时锚点行不放大字号，
-    // 仅把颜色加重到移动端聚焦行的量级（主行 alpha 0.85 / 译行 0.70）。
-    final lyricStyle = LyricStyles.default1.copyWith(
-      textStyle: Theme.of(context).textTheme.titleLarge!.copyWith(
-        color: Colors.white.withValues(alpha: .34),
-        fontSize: inactiveFontSize,
-        height: 1.18,
-        fontWeight: FontWeight.w800,
-      ),
-      activeStyle: Theme.of(context).textTheme.headlineMedium!.copyWith(
-        color: Colors.white.withValues(alpha: .34),
-        fontSize: fontSize,
-        height: 1.18,
-        fontWeight: FontWeight.w900,
-      ),
-      selectedColor: Colors.white.withValues(alpha: .85),
-      selectedTranslationColor: Colors.white.withValues(alpha: .70),
-      lineGap: widget.compact ? 10 : 16,
-      contentPadding: EdgeInsets.symmetric(
-        horizontal: 24,
-        vertical: widget.compact ? 20 : 40,
-      ),
-      fadeRange: FadeRange(top: 40, bottom: 40),
-      textAlign: TextAlign.left,
-      contentAlignment: CrossAxisAlignment.start,
-      activeHighlightColor: Colors.white,
-    );
-
+    // 手机横屏 / 车机：Apple Music 歌词动效（模糊/缩放/逐字扫光/弹簧滚动），
+    // 准星胶囊与 3.5s 恢复跟随由 ShiyinAppleLyrics 内部保留。
     return ExcludeSemantics(
       // 歌词视图高频更新会触发 Windows AXTree 竞态崩溃，仅桌面排除
       excluding: isDesktopPlatform,
-      child: Stack(
-        children: [
-          LyricView(controller: _lyricController, style: lyricStyle),
-          _buildSelectionCrosshair(),
-        ],
+      child: ShiyinAppleLyrics(
+        player: player,
+        songHash: widget.songHash,
+        lyrics: lyrics,
+        showTranslation: widget.showTranslation,
+        showRomanization: widget.showRomanization,
+        lyricScale: widget.compact ? 0.85 : 1.0,
+        isPageVisible: true,
+        onLongPressLine: widget.onOpenLyricOffset == null
+            ? null
+            : _openOffsetAtCenter,
       ),
-    );
-  }
-
-  /// 用户滚动歌词时的准星覆盖层：与移动端 MobileLyricList 同款——
-  /// 左侧渐隐准星线 + 右侧 [ ▶ mm:ss ] 播放胶囊，点击跳转播放并立即恢复
-  /// 跟随播放行；点击歌词行直接跳播的逻辑保持不变。
-  Widget _buildSelectionCrosshair() {
-    return SelectListenableBuilder(
-      controller: _lyricController,
-      builder: (state, _) {
-        return Positioned(
-          left: 0,
-          right: 12,
-          top: state.centerY - 14,
-          height: 28,
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.center,
-            children: [
-              Expanded(
-                // 准星线仅 1px 高且不参与命中，保证拖拽手势穿透回歌词视图
-                child: IgnorePointer(
-                  child: Container(
-                    height: 1,
-                    margin: const EdgeInsets.only(right: 10),
-                    decoration: BoxDecoration(
-                      gradient: LinearGradient(
-                        colors: [
-                          Colors.white.withValues(alpha: 0.0),
-                          Colors.white.withValues(alpha: 0.08),
-                          Colors.white.withValues(alpha: 0.28),
-                          Colors.white.withValues(alpha: 0.14),
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-              LyricSeekPointerButton(
-                key: const ValueKey('landscape_lyric_seek_pointer_button'),
-                timeText: formatDuration(state.duration),
-                onTap: () {
-                  // 先校准进度（防跳转后回 0 闪动），再退出选区恢复跟随，
-                  // 最后走与点击歌词行相同的跳播路径。
-                  _lastSentProgress = state.duration;
-                  _lyricController.setProgress(state.duration);
-                  _lyricController.stopSelection();
-                  widget.player.seekToAndPlay(state.duration);
-                },
-              ),
-            ],
-          ),
-        );
-      },
     );
   }
 }

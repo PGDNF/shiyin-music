@@ -82,6 +82,10 @@ dependencies:
   local_notifier: ^0.1.6
   launch_at_startup: ^0.3.1
   flutter_svg: ^2.2.0
+  # Apple Music 歌词动效移植（md3Music，AGPL-3.0）：TTML 歌词解析
+  xml: ^6.5.0
+  # 流光背景封面取色
+  palette_generator: ^0.3.3+7
 
 dev_dependencies:
   flutter_lints: ^6.0.0
@@ -115,6 +119,8 @@ dependency_overrides:
 
 flutter:
   uses-material-design: true
+  shaders:
+    - shaders/flowing_background.frag
   assets:
     - update.md
     - lib/assets/logo.png
