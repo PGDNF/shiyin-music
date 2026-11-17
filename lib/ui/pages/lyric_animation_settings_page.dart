@@ -69,6 +69,7 @@ class _LyricAnimationSettingsPageState
             children: [
               _SliderTile(
                 title: '歌词非当前行缩放',
+                subtitle: '除当前行外所有行的字号缩放（只改大小，不改清晰度）',
                 value: prefs.inactiveScale,
                 min: LyricPreferences.minInactiveScaleForCurrentPlatform,
                 max: LyricPreferences.maxInactiveScaleForCurrentPlatform,
@@ -82,6 +83,15 @@ class _LyricAnimationSettingsPageState
                 max: LyricPreferences.maxAlignPositionForCurrentPlatform,
                 format: (v) => v.toStringAsFixed(2),
                 onCommit: prefs.setAlignPosition,
+              ),
+              _SliderTile(
+                title: '歌词行间距',
+                subtitle: '行与行之间的垂直间距倍数（调小更紧凑、调大更疏朗）',
+                value: prefs.lineSpacing,
+                min: LyricPreferences.minLineSpacingForCurrentPlatform,
+                max: LyricPreferences.maxLineSpacingForCurrentPlatform,
+                format: (v) => v.toStringAsFixed(2),
+                onCommit: prefs.setLineSpacing,
               ),
               _section('当前行细节'),
               _SliderTile(
@@ -237,7 +247,8 @@ class _LyricAnimationSettingsPageState
               if (prefs.useGaussianBlur) ...[
                 _SliderTile(
                   title: '歌词模糊强度',
-                  subtitle: '非当前行高斯模糊强度倍数',
+                  subtitle: '非当前行高斯模糊强度倍数；调低或关闭「歌词高斯模糊」'
+                      '可让其它行更清楚',
                   value: prefs.blurIntensity,
                   min: LyricPreferences.minBlurIntensityForCurrentPlatform,
                   max: LyricPreferences.maxBlurIntensityForCurrentPlatform,
@@ -424,7 +435,7 @@ class _LyricAnimationSettingsPageState
         return AlertDialog(
           title: const Text('恢复本页默认值'),
           content: const Text(
-            '将把本页全部参数（非当前行缩放、当前行位置、已播字上浮高度、'
+            '将把本页全部参数（非当前行缩放、当前行位置、歌词行间距、已播字上浮高度、'
             '已播歌词透明度、未播歌词透明度、'
             '间奏点水平位置、间奏点圆点大小、间奏点间距、'
             '错峰上限/步长/衰减、错峰起点开关、歌词模糊强度、'
@@ -453,6 +464,8 @@ class _LyricAnimationSettingsPageState
         LyricPreferences.defaultInactiveScaleForCurrentPlatform);
     await prefs.setAlignPosition(
         LyricPreferences.defaultAlignPositionForCurrentPlatform);
+    await prefs.setLineSpacing(
+        LyricPreferences.defaultLineSpacingForCurrentPlatform);
     await prefs.setLiftHeightPx(
         LyricPreferences.defaultLiftHeightPxForCurrentPlatform);
     await prefs.setPlayedOpacity(
