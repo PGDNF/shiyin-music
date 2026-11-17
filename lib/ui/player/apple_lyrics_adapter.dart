@@ -5,7 +5,6 @@ import 'package:flutter/material.dart';
 import '../../controllers/player_controller.dart';
 import '../../models/music_models.dart';
 import '../../widgets/apple_lyrics/apple_lyrics_view.dart';
-import '../../widgets/apple_lyrics/layout/lyric_aux_scope.dart';
 import '../../widgets/apple_lyrics/layout/lyric_preferences.dart';
 import '../../widgets/apple_lyrics/models/lyric_line.dart' as apple;
 import 'lyric_seek_pointer_button.dart';
@@ -16,13 +15,11 @@ import 'lyric_seek_pointer_button.dart';
 /// 职责：
 /// 1. 时音 [LyricLine]（Duration 基）→ apple_lyrics [apple.LyricLine]（ms 基）；
 /// 2. 把时音设置（字号倍率 / 翻译 / 音译）同步进 [LyricPreferences]，
-///    并默认开启模糊 / 模糊交叉淡化 / 辉光（md3Music 原版靠设置面板开启）；
+///    动效开关首跑默认值见 [LyricPreferences.seedShiyinDefaults]，
+///    之后由「歌词动画」设置页管理；
 /// 3. 进度桥：player.lyricPosition（平滑 + 歌词偏移）→ positionListenable，
 ///    暂停时调整偏移也能即时刷新（监听 player 通知补齐位置流空窗）；
 /// 4. 保留原 MobileLyricList 的准星胶囊 UX：拖动时 38% 焦点线 + 时间胶囊。
-
-/// 焦点线位置（与原 MobileLyricList 一致）。
-const double _kFocusLineFraction = 0.38;
 
 /// 无时长信息的末行兜底时长。
 const int _kFallbackLineDurationMs = 5000;
@@ -60,6 +57,10 @@ apple.LyricLine _convertLine(LyricLine line, Duration? nextTime) {
 
 /// 把时音歌词设置同步进 apple_lyrics 偏好单例。
 ///
+/// 模糊 / 辉光 / 锚位等动效参数首跑由 [LyricPreferences.seedShiyinDefaults]
+/// 写入默认值，之后完全交给「歌词动画」设置页与预设导入管理，这里不再
+/// 强制覆盖（否则用户调的参数每次进歌词页都会被重置）。
+///
 /// 翻译/音译：apple_lyrics 副行一次只显示一种（displayMode），两者同时开启
 /// 时优先翻译（与时音默认观感一致）；副行显示范围对齐时音的「所有行」。
 Future<void> syncAppleLyricPreferences({
@@ -68,12 +69,7 @@ Future<void> syncAppleLyricPreferences({
   required bool showRomanization,
 }) async {
   final prefs = LyricPreferences.instance;
-  await prefs.load();
-  await prefs.setUseGaussianBlur(true);
-  await prefs.setBlurLevelCrossfade(true);
-  await prefs.setUseGlowEffect(true);
-  await prefs.setAlignPosition(_kFocusLineFraction);
-  await prefs.setAuxScope(LyricAuxScope.allLines);
+  await prefs.seedShiyinDefaults();
   await prefs.setFontSize(
     LyricPreferences.defaultFontSizeForCurrentPlatform * lyricScale,
   );
@@ -186,9 +182,14 @@ class _ShiyinAppleLyricsState extends State<ShiyinAppleLyrics> {
   @override
   Widget build(BuildContext context) {
     final lines = _convertIfNeeded();
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final targetY = constraints.maxHeight * _kFocusLineFraction;
+    // 锚位跟随「歌词动画」页设置：拖动歌词时的准星胶囊与歌词焦点线同位。
+    return ListenableBuilder(
+      listenable: LyricPreferences.instance,
+      builder: (context, _) {
+        return LayoutBuilder(
+          builder: (context, constraints) {
+            final targetY =
+                constraints.maxHeight * LyricPreferences.instance.alignPosition;
         final focusedLine =
             (_holding &&
                 _focusIndex >= 0 &&
@@ -267,6 +268,8 @@ class _ShiyinAppleLyricsState extends State<ShiyinAppleLyrics> {
                 ),
             ],
           ),
+        );
+          },
         );
       },
     );

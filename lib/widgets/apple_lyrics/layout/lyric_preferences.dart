@@ -997,6 +997,35 @@ class LyricPreferences extends ChangeNotifier {
   double get lineHeightMultiplier =>
       (_fontSize / defaultFontSize) * _lineSpacing;
 
+  /// 时音移植首跑默认（本地新增，见 NOTICE.md）：仅当对应键尚未写入时
+  /// 落盘——模糊 / 模糊交叉淡化 / 辉光 / 流光背景默认开启、滚动锚位 0.38、
+  /// 副行范围所有行（md3Music 原版这些默认关闭、靠设置面板开启）。
+  /// 不覆盖用户在「歌词动画」页调节或预设导入写入的值。
+  Future<void> seedShiyinDefaults() async {
+    final prefs = await SharedPreferences.getInstance();
+    final seeded = <String, Object>{};
+    void seed(String key, Object value) {
+      if (!prefs.containsKey(key)) seeded[key] = value;
+    }
+
+    seed(_keyUseGaussianBlur, true);
+    seed(_keyBlurLevelCrossfade, true);
+    seed(_keyUseGlowEffect, true);
+    seed(_keyUseFlowingBackground, true);
+    seed(_keyAlignPosition, 0.38);
+    seed(_keyAuxScope, LyricAuxScope.allLines.name);
+    if (seeded.isNotEmpty) {
+      for (final entry in seeded.entries) {
+        final value = entry.value;
+        if (value is bool) await prefs.setBool(entry.key, value);
+        if (value is double) await prefs.setDouble(entry.key, value);
+        if (value is String) await prefs.setString(entry.key, value);
+      }
+      _loaded = false;
+    }
+    await load();
+  }
+
   /// 从 SharedPreferences 加载。App 启动时调用一次。
   Future<void> load() async {
     if (_loaded) return;

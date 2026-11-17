@@ -8,6 +8,7 @@ import '../../services/music_api.dart';
 import '../form_factor.dart';
 import '../pages/audio_interruption_settings_page.dart';
 import '../pages/desktop_lyrics_settings_page.dart';
+import '../pages/lyric_animation_settings_page.dart';
 import '../pages/playback_history_page.dart';
 import '../pages/playback_stats_page.dart';
 import '../widgets/audio_effects_sheet.dart';
@@ -216,6 +217,23 @@ class PlaybackSettingsSection extends StatelessWidget {
 
     // ---- 歌词与设备 ----
     final lyricTiles = <Widget>[];
+    // Apple Music 风格歌词动效参数与预设：手机/车机横屏歌词面板消费这些
+    // 参数；PC 分栏走 DesktopLyricList，不显示入口。
+    if (!isDesktopFormFactor) {
+      lyricTiles.add(
+        SettingsTile(
+          icon: Icons.auto_awesome_rounded,
+          iconColor: const Color(0xFFFF6D00),
+          title: '歌词动画',
+          subtitle: 'Apple Music 风格动效参数、动画预设与 JSON 导入导出',
+          onTap: () => Navigator.of(context).push(
+            MaterialPageRoute(
+              builder: (_) => const LyricAnimationSettingsPage(),
+            ),
+          ),
+        ),
+      );
+    }
     if (player.isDesktopLyricsSupported) {
       lyricTiles.add(
         SettingsSwitchTile(

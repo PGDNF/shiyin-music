@@ -22,6 +22,10 @@
   `lib/core/services/rhythm_motion.dart`、
   `lib/core/services/spectrum_service.dart`、
   `lib/core/services/diagnostic_logger.dart`
+- `lib/ui/pages/lyric_animation_settings_page.dart`（重写自
+  `lib/modules/settings/lyric_animation_settings_page.dart`：M3E 滑块/按钮组
+  换原生 Material，TV 遥控分支移除，toast 换宿主 Toast；预设管理/JSON
+  导入导出逻辑保留）
 
 ## 本地修改
 
@@ -30,5 +34,11 @@
   与预览页 `preview/` 未移植），补齐 Flutter 基础导入
 - `flowing_background_palette.dart` 的默认取色 loader 改为宿主注入
   （`defaultArtworkColorLoader`），不再依赖 md3Music 的封面缓存服务
+- `layout/lyric_preferences.dart` 新增 `seedShiyinDefaults()`：首跑仅对缺失键
+  写入时音默认（模糊/辉光/交叉淡化/流光开启、锚位 0.38、副行所有行），
+  不覆盖用户设置
+- `layout/lyric_layout.dart` 拖动自动回位时长 3000ms → 3500ms（对齐时音）
+- `apple_lyrics_view.dart` 新增 `onLongPress` / `onUserScrollingChanged` /
+  `onScrollFocusLineChanged` 钩子供宿主准星胶囊与长按调偏移使用
 
 依据 AGPL-3.0，包含本代码的组合作品分发时需以 AGPL-3.0 提供完整对应源码。
