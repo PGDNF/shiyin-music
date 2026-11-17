@@ -1,5 +1,6 @@
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
 
 /// 流光渐变绘制器（回退实现，只画光斑；不透明基底由宿主铺一层渐变）。

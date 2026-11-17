@@ -22,7 +22,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter/scheduler.dart';
 
 import '../../core/utils/app_haptics.dart';
-import 'package:flutter/widgets.dart';
+import 'package:flutter/material.dart';
 
 import '../../core/build_flags.dart';
 import '../../core/services/player_frame_driver.dart';

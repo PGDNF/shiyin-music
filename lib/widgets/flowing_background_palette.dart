@@ -1,5 +1,5 @@
 import 'dart:math' as math;
-import 'dart:ui' show Color;
+import 'package:flutter/painting.dart';
 
 /// 每个 pigment 场的运动色变体数（4 场 × 8 变体 = 32 个 motionColors）。
 const int fluidMotionColourCount = 8;

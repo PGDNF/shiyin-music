@@ -22,11 +22,7 @@ Future<List<Color>?> loadFlowingArtworkColors(String url) async {
     maximumColorCount: 12,
     timeout: const Duration(seconds: 10),
   );
-  final colors = <Color>[
-    for (final target in PaletteTarget.values)
-      if (palette.paletteColors[target] != null)
-        palette.paletteColors[target]!.color,
-  ];
+  final colors = palette.colors.toList();
   return colors.isEmpty ? null : colors;
 }
 

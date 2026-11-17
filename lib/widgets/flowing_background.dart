@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
-import 'package:flutter/widgets.dart';
+import 'package:flutter/material.dart';
 
 
 import '../core/services/player_frame_driver.dart';
