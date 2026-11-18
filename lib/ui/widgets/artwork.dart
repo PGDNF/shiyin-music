@@ -4,6 +4,7 @@ import 'dart:math' show cos, min, pi;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../../controllers/local_music_controller.dart';
 import '../../services/disk_cached_image_provider.dart';
 import '../../services/network_monitor.dart';
 import '../form_factor.dart';
@@ -237,7 +238,6 @@ class ContentUriImage extends StatefulWidget {
 }
 
 class _ContentUriImageState extends State<ContentUriImage> {
-  static const _channel = MethodChannel('shiyin_music/local_music');
   Uint8List? _bytes;
   bool _loading = true;
 
@@ -266,31 +266,12 @@ class _ContentUriImageState extends State<ContentUriImage> {
 
   Future<void> _loadImage() async {
     final generation = ++_loadGeneration;
-    final uri = widget.uri;
-    try {
-      // 从 content URI 中提取 albumId
-      final albumId = int.tryParse(uri.split('/').last);
-      if (albumId == null || albumId <= 0) {
-        if (mounted && generation == _loadGeneration) {
-          setState(() => _loading = false);
-        }
-        return;
-      }
-      final bytes = await _channel.invokeMethod<Uint8List>(
-        'getAlbumArt',
-        {'albumId': albumId},
-      );
-      if (mounted && generation == _loadGeneration) {
-        setState(() {
-          _bytes = bytes;
-          _loading = false;
-        });
-      }
-    } catch (e) {
-      if (mounted && generation == _loadGeneration) {
-        setState(() => _loading = false);
-      }
-    }
+    final bytes = await LocalMusicController.albumArtBytes(widget.uri);
+    if (!mounted || generation != _loadGeneration) return;
+    setState(() {
+      _bytes = bytes;
+      _loading = false;
+    });
   }
 
   @override

@@ -26,6 +26,20 @@ class LocalMusicController extends ChangeNotifier {
   }
 
   static const _channel = MethodChannel('shiyin_music/local_music');
+
+  /// 取 content:// 专辑 URI 的封面字节流（海报/背景/流光取色共用）。
+  /// 非法 URI / 无封面 / 通道失败统一返回 null，调用方各自兜底。
+  static Future<Uint8List?> albumArtBytes(String uri) async {
+    final albumId = int.tryParse(uri.split('/').last);
+    if (albumId == null || albumId <= 0) return null;
+    try {
+      return await _channel.invokeMethod<Uint8List>('getAlbumArt', {
+        'albumId': albumId,
+      });
+    } catch (_) {
+      return null;
+    }
+  }
   static const _excludedFoldersKey = 'settings.local_music_excluded_folders';
 
   // ---- 桌面（Windows/Linux）扫描根目录 ----
