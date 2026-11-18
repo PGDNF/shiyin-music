@@ -646,8 +646,8 @@ class _FlowingBackgroundState extends State<FlowingBackground>
   /// 管线编译与绘制尺寸无关，小图即可命中同一份进程级管线缓存；
   /// 用独立的 uniform 状态，不污染在屏 painter 的脏检查基准。
   void _warmShaderPipeline() {
-    if (_pipelineWarmed || _shader == null) return;
-    _pipelineWarmed = true;
+    if (FlowingBackground._pipelineWarmed || _shader == null) return;
+    FlowingBackground._pipelineWarmed = true;
     final shader = _shader!;
     final values = Float32List(FlowingUniforms.uniformFloatCount);
     final state = FlowingUniformState();
