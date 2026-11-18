@@ -159,6 +159,10 @@ const _kBluetoothLyricHeartbeat = Duration(seconds: 1);
 // 歌词进度偏移：按歌曲 hash 保存毫秒值（正 = 歌词提前），见 lyricOffset。
 const _lyricOffsetsSettingKey = 'settings.lyric_offset_per_song';
 const _keepScreenOnSettingKey = 'settings.keep_screen_on';
+// 播放页封面背景：模糊强度默认 30（对齐 md3Music 观感，旧版固定 24）；
+// 旋转默认关 = 静态背景更省电，用户可在 设置-播放 打开。
+const _coverBlurSigmaSettingKey = 'settings.cover_blur_sigma';
+const _coverRotationSettingKey = 'settings.cover_rotation_enabled';
 // 歌词页切歌键（issue #3）：默认关 = QQ 音乐原版底栏，用户可在 设置-播放 打开。
 const _lyricPageSkipButtonsSettingKey = 'settings.lyric_page_skip_buttons';
 // 搜索点歌替换播放队列（issue #6-3）：默认关 = 只把该曲插入当前队列播放
@@ -707,6 +711,19 @@ abstract class _PlayerControllerBase extends ChangeNotifier {
   /// 真实生效条件是 [keepScreenOnEnabled] **且** [isPlaying]：暂停/停播时
   /// 交回系统休眠。历史上是无条件常亮，导致暂停后停在播放页仍在烧屏。
   bool keepScreenOnEnabled = true;
+
+  /// 播放页封面背景的高斯模糊强度（0 = 清晰原图）。
+  ///
+  /// 默认 30 对齐 md3Music 的封面背景观感（本仓旧版固定 24）。模糊作用在
+  /// 100×100 的缓存缩略图上，改强度的重栅格化成本极低，设置页滑块可
+  /// 拖动实时预览。
+  double coverBlurSigma = 30;
+
+  /// 播放页封面背景是否在播放时缓慢旋转（40s 一圈）。
+  ///
+  /// 默认 false = 静态背景（更省电，模糊层光栅缓存更稳）；打开后暂停 /
+  /// 页面不可见 / 应用退后台仍冻结在当前角度。
+  bool coverRotationEnabled = false;
 
   /// 歌词页底部是否显示上一首/下一首切歌键（issue #3）。
   ///

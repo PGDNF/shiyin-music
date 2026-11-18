@@ -172,6 +172,22 @@ class PlaybackSettingsSection extends StatelessWidget {
       }
     }
 
+    // ---- 播放页背景 ----
+    final backdropTiles = <Widget>[
+      _CoverBlurSliderTile(player: player),
+      const SettingsDivider(),
+      SettingsSwitchTile(
+        icon: Icons.rotate_right_rounded,
+        iconColor: const Color(0xFF8E24AA),
+        title: '封面背景旋转',
+        subtitle: player.coverRotationEnabled
+            ? '播放时背景封面缓慢旋转（40 秒一圈），暂停或划走即冻结'
+            : '背景封面保持静止（默认，更省电）；打开后播放时缓慢旋转',
+        value: player.coverRotationEnabled,
+        onChanged: player.setCoverRotationEnabled,
+      ),
+    ];
+
     // ---- 后台与网络（移动端/车机专属）----
     final backgroundTiles = <Widget>[];
     if (!isDesktopFormFactor) {
@@ -342,6 +358,7 @@ class PlaybackSettingsSection extends StatelessWidget {
       children: [
         _group('音质与音效', qualityTiles),
         _group('播放行为', behaviorTiles),
+        _group('播放页背景', backdropTiles),
         if (backgroundTiles.isNotEmpty) _group('后台与网络', backgroundTiles),
         if (lyricTiles.isNotEmpty) _group('歌词与设备', lyricTiles),
         _group('内容与数据', dataTiles),
@@ -360,6 +377,85 @@ class PlaybackSettingsSection extends StatelessWidget {
         SettingsCard(children: children),
         const SizedBox(height: 20),
       ],
+    );
+  }
+}
+
+/// 封面背景模糊强度滑块：拖动即写入偏好实时预览（模糊作用在 100×100
+/// 缩略图上，重栅格化成本极低），视觉与 [SettingsSwitchTile] 同款。
+class _CoverBlurSliderTile extends StatelessWidget {
+  const _CoverBlurSliderTile({required this.player});
+
+  final PlayerController player;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    const iconColor = Color(0xFF3949AB);
+    final value = player.coverBlurSigma.clamp(0.0, 60.0).toDouble();
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(14, 8, 14, 0),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 36,
+                height: 36,
+                decoration: BoxDecoration(
+                  color: iconColor.withValues(alpha: isDark ? .22 : .10),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: const Center(
+                  child: Icon(Icons.blur_on_rounded, size: 20, color: iconColor),
+                ),
+              ),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '封面背景模糊',
+                      style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                        fontWeight: FontWeight.w700,
+                        fontSize: 15,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      '高斯模糊强度，0 = 清晰原图（默认 30，对齐 md3Music）',
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: colorScheme.onSurfaceVariant,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 8),
+              Text(
+                value.round().toString(),
+                style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                  fontWeight: FontWeight.w700,
+                  fontSize: 15,
+                  color: colorScheme.primary,
+                ),
+              ),
+            ],
+          ),
+          Slider(
+            value: value,
+            min: 0,
+            max: 60,
+            divisions: 60,
+            onChanged: (v) => player.setCoverBlurSigma(v),
+          ),
+        ],
+      ),
     );
   }
 }

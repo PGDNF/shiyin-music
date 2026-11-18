@@ -36,6 +36,25 @@ mixin _PlayerSettings on _PlayerControllerBase {
     notifyListeners();
   }
 
+  /// 调节封面背景高斯模糊强度（设置页滑块拖动实时预览）。
+  Future<void> setCoverBlurSigma(double sigma) async {
+    final double clamped = sigma.clamp(0.0, 60.0).toDouble();
+    if (coverBlurSigma == clamped) return;
+    coverBlurSigma = clamped;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_coverBlurSigmaSettingKey, clamped);
+    notifyListeners();
+  }
+
+  /// 开关封面背景缓慢旋转（默认关 = 静态背景）。
+  Future<void> setCoverRotationEnabled(bool enabled) async {
+    if (coverRotationEnabled == enabled) return;
+    coverRotationEnabled = enabled;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_coverRotationSettingKey, enabled);
+    notifyListeners();
+  }
+
   /// 开关「搜索点歌替换播放队列」（issue #6-3：默认关 = 插入当前队列）。
   Future<void> setSearchPlayReplaceQueue(bool enabled) async {
     if (searchPlayReplaceQueue == enabled) return;
@@ -390,6 +409,12 @@ mixin _PlayerSettings on _PlayerControllerBase {
     } catch (_) {}
     keepScreenOnEnabled =
         prefs.getBool(_keepScreenOnSettingKey) ?? keepScreenOnEnabled;
+    coverBlurSigma =
+        (prefs.getDouble(_coverBlurSigmaSettingKey) ?? coverBlurSigma)
+            .clamp(0.0, 60.0)
+            .toDouble();
+    coverRotationEnabled =
+        prefs.getBool(_coverRotationSettingKey) ?? coverRotationEnabled;
     lyricPageSkipButtonsEnabled =
         prefs.getBool(_lyricPageSkipButtonsSettingKey) ??
         lyricPageSkipButtonsEnabled;

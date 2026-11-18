@@ -341,8 +341,10 @@ class _PlayerBodyState extends State<_PlayerBody>
                       playing: widget.player.isPlaying,
                       // 与 _lyricPageVisible 互补：划到歌词页后封面页仍被
                       // PageView（allowImplicitScrolling）缓存在树上，不门控
-                      // 的话整屏旋转 + sigma24 模糊会继续按刷新率空转。
+                      // 的话整屏旋转 + 模糊会继续按刷新率空转。
                       pageVisible: _page == 0 || _pageScrolling,
+                      blurSigma: widget.player.coverBlurSigma,
+                      rotationEnabled: widget.player.coverRotationEnabled,
                     ),
                     // Apple Music 流光背景（md3Music 移植）：视觉上仅歌词页
                     // 显示，与模糊封面交叉淡入淡出；但 ticker 与 shader 自

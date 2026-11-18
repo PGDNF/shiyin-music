@@ -13,6 +13,8 @@ class ArtworkBackground extends StatefulWidget {
     required this.song,
     this.playing = true,
     this.pageVisible = true,
+    this.blurSigma = 30,
+    this.rotationEnabled = false,
   });
 
   final Song song;
@@ -26,6 +28,12 @@ class ArtworkBackground extends StatefulWidget {
   /// `allowImplicitScrolling` 缓存在树上，若不门控，整屏旋转+模糊会
   /// 在被划走的页面里继续按显示刷新率空转。
   final bool pageVisible;
+
+  /// 高斯模糊强度（0 = 跳过模糊层，清晰原图）。默认 30 对齐 md3Music。
+  final double blurSigma;
+
+  /// 是否允许播放时缓慢旋转；关闭时角度归零保持静态背景。
+  final bool rotationEnabled;
 
   @override
   State<ArtworkBackground> createState() => _ArtworkBackgroundState();
@@ -68,18 +76,26 @@ class _ArtworkBackgroundState extends State<ArtworkBackground>
   void didUpdateWidget(covariant ArtworkBackground oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.playing != widget.playing ||
-        oldWidget.pageVisible != widget.pageVisible) {
+        oldWidget.pageVisible != widget.pageVisible ||
+        oldWidget.rotationEnabled != widget.rotationEnabled) {
       _syncRotation();
     }
   }
 
   void _syncRotation() {
-    if (widget.playing && widget.pageVisible && !_appHidden) {
+    if (widget.rotationEnabled &&
+        widget.playing &&
+        widget.pageVisible &&
+        !_appHidden) {
       if (!_rotationController.isAnimating) {
         _rotationController.repeat();
       }
     } else if (_rotationController.isAnimating) {
       _rotationController.stop(canceled: false);
+    }
+    // 开关关闭时归零角度：静态背景保持封面正立，而不是停在斜角。
+    if (!widget.rotationEnabled && _rotationController.value != 0) {
+      _rotationController.value = 0;
     }
   }
 
@@ -96,6 +112,18 @@ class _ArtworkBackgroundState extends State<ArtworkBackground>
     final size = MediaQuery.sizeOf(context);
     final maxDim = math.max(size.width, size.height);
     final squareSize = maxDim * 1.2;
+    // 走磁盘缓存链路：重进播放页时背景从本地字节秒出，不再等网络往返。
+    // 模糊档用 100×100 缩略图：高斯模糊作用在小图上，改 sigma 的重栅格化
+    // 成本极低（设置页滑块可实时预览）；0 档不模糊，改走全分辨率，
+    // 否则全屏放大缩略图只会得到马赛克而不是「清晰原图」。
+    Widget coverImage(String url, {bool thumbnail = true}) =>
+        RetryableNetworkImage(
+          url: url,
+          fit: BoxFit.cover,
+          cacheWidth: thumbnail ? 100 : null,
+          cacheHeight: thumbnail ? 100 : null,
+          errorBuilder: (context, error, stackTrace) => const SizedBox.shrink(),
+        );
 
     // 旋转动画背景是纯装饰性的，仅桌面 Windows 排除语义树（AXTree 竞态）。
     // 外层 RepaintBoundary 把整块装饰背景与上层 UI 的图层彻底隔离：
@@ -115,28 +143,23 @@ class _ArtworkBackgroundState extends State<ArtworkBackground>
                 minWidth: squareSize,
                 minHeight: squareSize,
                 // 旋转必须在模糊之外。旋转在内时模糊的输入每帧都在变，
-                // 整块全屏图层每帧都要重跑 sigma=24 的高斯模糊，光栅缓存
-                // 永远命中不了；换序后模糊结果落在 RepaintBoundary 的独立
-                // 图层里只栅格化一次，每帧只付一次廉价变换。
+                // 整块全屏图层每帧都要重跑高斯模糊，光栅缓存永远命中不了；
+                // 换序后模糊结果落在 RepaintBoundary 的独立图层里只栅格化
+                // 一次，每帧只付一次廉价变换。
                 // 各向同性高斯对旋转可交换，且封面被 OverflowBox 放大到
                 // maxDim*1.2（旋转后仍完全覆盖视口），边缘采样差异不可见。
                 child: RotationTransition(
                   turns: _rotationController,
                   child: RepaintBoundary(
-                    child: ImageFiltered(
-                      imageFilter: ImageFilter.blur(sigmaX: 24, sigmaY: 24),
-                      // 走磁盘缓存链路：重进播放页时背景从本地字节秒出，
-                      // 不再等网络往返（重模糊 + 渐变兜底下网络闪烁原本就不明显，
-                      // 磁盘命中后这一帧也不再有）。
-                      child: RetryableNetworkImage(
-                        url: coverUrl,
-                        fit: BoxFit.cover,
-                        cacheWidth: 100,
-                        cacheHeight: 100,
-                        errorBuilder: (context, error, stackTrace) =>
-                            const SizedBox.shrink(),
-                      ),
-                    ),
+                    child: widget.blurSigma <= 0
+                        ? coverImage(coverUrl, thumbnail: false)
+                        : ImageFiltered(
+                            imageFilter: ImageFilter.blur(
+                              sigmaX: widget.blurSigma,
+                              sigmaY: widget.blurSigma,
+                            ),
+                            child: coverImage(coverUrl),
+                          ),
                   ),
                 ),
               ),
