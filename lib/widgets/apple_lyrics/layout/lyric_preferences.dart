@@ -687,6 +687,9 @@ class LyricPreferences extends ChangeNotifier {
   static const String _keyUnplayedOpacity = 'lyric_unplayed_opacity';
   static const String _keyAuxScope = 'lyric_aux_scope';
 
+  /// 副行范围一次性迁移标记（旧版无开关，allLines 必为程序写入）。
+  static const String _keyAuxScopeMigrated = 'lyric_aux_scope_migrated_v2';
+
   // ============== 当前值 ==============
 
   double _fontSize = defaultFontSizeForCurrentPlatform;
@@ -1013,7 +1016,9 @@ class LyricPreferences extends ChangeNotifier {
     seed(_keyUseGlowEffect, true);
     seed(_keyUseFlowingBackground, true);
     seed(_keyAlignPosition, 0.38);
-    seed(_keyAuxScope, LyricAuxScope.allLines.name);
+    // 副行默认跟随当前行（md3 默认）：翻译/音译随切行展开收起才有动画；
+    // allLines 时进度恒 1，出现/消失动效完全 idle。
+    seed(_keyAuxScope, LyricAuxScope.currentLine.name);
     if (seeded.isNotEmpty) {
       for (final entry in seeded.entries) {
         final value = entry.value;
@@ -1021,6 +1026,15 @@ class LyricPreferences extends ChangeNotifier {
         if (value is double) await prefs.setDouble(entry.key, value);
         if (value is String) await prefs.setString(entry.key, value);
       }
+      _loaded = false;
+    }
+    // 一次性迁移：旧版本没有副行范围开关，lyric_aux_scope 只可能被
+    // seed/适配层写成 allLines（副行进度恒 1，出现/消失动画被冻住）。
+    // 当时不存在用户入口，故可安全覆盖回 currentLine 一次；写入迁移
+    // 标记后，新版设置页里用户的选择不再被触碰。
+    if (!prefs.containsKey(_keyAuxScopeMigrated)) {
+      await prefs.setString(_keyAuxScope, LyricAuxScope.currentLine.name);
+      await prefs.setBool(_keyAuxScopeMigrated, true);
       _loaded = false;
     }
     await load();

@@ -25,7 +25,7 @@
 - `lib/ui/pages/lyric_animation_settings_page.dart`（重写自
   `lib/modules/settings/lyric_animation_settings_page.dart`：M3E 滑块/按钮组
   换原生 Material，TV 遥控分支移除，toast 换宿主 Toast；预设管理/JSON
-  导入导出逻辑保留）
+  导入导出逻辑保留；新增「副行显示范围」分段与歌词行间距滑块）
 
 ## 本地修改
 
@@ -35,10 +35,17 @@
 - `flowing_background_palette.dart` 的默认取色 loader 改为宿主注入
   （`defaultArtworkColorLoader`），不再依赖 md3Music 的封面缓存服务
 - `layout/lyric_preferences.dart` 新增 `seedShiyinDefaults()`：首跑仅对缺失键
-  写入时音默认（模糊/辉光/交叉淡化/流光开启、锚位 0.38、副行所有行），
-  不覆盖用户设置
+  写入时音默认（模糊/辉光/交叉淡化/流光开启、锚位 0.38、副行当前行），
+  不覆盖用户设置；另含一次性迁移（`lyric_aux_scope_migrated_v2` 标记）：
+  旧版无副行范围开关、`lyric_aux_scope` 必为程序写入的 allLines（副行
+  动画冻住），迁移覆盖回 currentLine 一次，之后不再触碰用户选择
 - `layout/lyric_layout.dart` 拖动自动回位时长 3000ms → 3500ms（对齐时音）
 - `apple_lyrics_view.dart` 新增 `onLongPress` / `onUserScrollingChanged` /
-  `onScrollFocusLineChanged` 钩子供宿主准星胶囊与长按调偏移使用
+  `onScrollFocusLineChanged` 钩子供宿主准星胶囊与长按调偏移使用；
+  新增可见窗口逐帧预热（TickerMode unmute / 切歌后每帧准备一行字形与
+  副行图，摊平首帧集中开销）
+- `flowing_background.dart` 新增 shader 管线离屏预热（挂载期 16×16
+  光栅一帧提前编译 Impeller 管线；宿主把流光常驻在 Opacity=0，避免
+  管线首编译落在封面→歌词滑动手势帧上）
 
 依据 AGPL-3.0，包含本代码的组合作品分发时需以 AGPL-3.0 提供完整对应源码。

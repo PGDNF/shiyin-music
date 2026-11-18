@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 
 import '../../core/utils/app_haptics.dart';
 import '../../widgets/apple_lyrics/layout/lyric_animation_preset_store.dart';
+import '../../widgets/apple_lyrics/layout/lyric_aux_scope.dart';
 import '../../widgets/apple_lyrics/layout/lyric_preferences.dart';
 import '../widgets/toast.dart';
 
@@ -124,6 +125,8 @@ class _LyricAnimationSettingsPageState
                 format: (v) => '${(v * 100).round()}%',
                 onCommit: prefs.setUnplayedOpacity,
               ),
+              _section('翻译 / 音译副行'),
+              _buildAuxScopeTile(prefs),
               _section('间奏点（节奏点）'),
               _SliderTile(
                 title: '间奏点水平位置',
@@ -424,6 +427,45 @@ class _LyricAnimationSettingsPageState
     );
   }
 
+  /// 「副行显示范围」二选一（当前行 ⇄ 所有行）。
+  ///
+  /// 当前行 = 翻译/音译随切行展开收起（带出现/消失动画，md3 默认观感）；
+  /// 所有行 = 每行副行常驻（进度恒 1，无展开收起动画）。
+  Widget _buildAuxScopeTile(LyricPreferences prefs) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const ListTile(
+          contentPadding: EdgeInsets.symmetric(horizontal: 16),
+          title: Text('副行显示范围'),
+          subtitle: Text(
+            '当前行 = 翻译/音译只跟随当前行展开收起（有出现与消失动画）；'
+            '所有行 = 每行副行常驻显示（无展开收起动画）',
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: Center(
+            child: SegmentedButton<int>(
+              segments: const [
+                ButtonSegment(value: 0, label: Text('当前行')),
+                ButtonSegment(value: 1, label: Text('所有行')),
+              ],
+              selected: {prefs.auxScope == LyricAuxScope.allLines ? 1 : 0},
+              onSelectionChanged: (selection) {
+                prefs.setAuxScope(
+                  selection.first == 1
+                      ? LyricAuxScope.allLines
+                      : LyricAuxScope.currentLine,
+                );
+              },
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
   /// 二次确认后把本页全部参数恢复默认（不动字号/行距等页外设置）。
   Future<void> _confirmResetAll(
     BuildContext context,
@@ -436,7 +478,7 @@ class _LyricAnimationSettingsPageState
           title: const Text('恢复本页默认值'),
           content: const Text(
             '将把本页全部参数（非当前行缩放、当前行位置、歌词行间距、已播字上浮高度、'
-            '已播歌词透明度、未播歌词透明度、'
+            '已播歌词透明度、未播歌词透明度、副行显示范围、'
             '间奏点水平位置、间奏点圆点大小、间奏点间距、'
             '错峰上限/步长/衰减、错峰起点开关、歌词模糊强度、'
             '模糊等级渐变切换、模糊等级渐变时长、提前换行、模糊褪去时长、'
@@ -472,6 +514,7 @@ class _LyricAnimationSettingsPageState
         LyricPreferences.defaultPlayedOpacityForCurrentPlatform);
     await prefs.setUnplayedOpacity(
         LyricPreferences.defaultUnplayedOpacityForCurrentPlatform);
+    await prefs.setAuxScope(LyricAuxScope.currentLine);
     await prefs.setInterludeDotsStartX(
         LyricPreferences.defaultInterludeDotsStartXForCurrentPlatform);
     await prefs.setInterludeDotRadius(
