@@ -163,7 +163,7 @@ class _ArtworkState extends State<Artwork> {
     final child = imageUrl == null
         ? _Fallback(icon: widget.icon)
         : imageUrl.startsWith('content://')
-            ? _ContentUriImage(
+            ? ContentUriImage(
                 uri: imageUrl,
                 size: widget.size,
                 borderRadius: widget.borderRadius,
@@ -201,13 +201,20 @@ class _ArtworkState extends State<Artwork> {
 }
 
 /// 加载 content:// URI 的图片（用于本地音乐专辑封面）。
-class _ContentUriImage extends StatefulWidget {
-  const _ContentUriImage({
+///
+/// 播放页背景也复用本组件（[decodeSide] 指定模糊档位解码边长，
+/// 加载/失败占位换 SizedBox.shrink 露出背景兜底渐变）。
+class ContentUriImage extends StatefulWidget {
+  const ContentUriImage({
+    super.key,
     required this.uri,
     required this.size,
-    required this.borderRadius,
-    required this.icon,
-    required this.highRes,
+    this.borderRadius = 8,
+    this.icon = Icons.music_note_rounded,
+    this.highRes = false,
+    this.decodeSide,
+    this.loadingPlaceholder,
+    this.errorPlaceholder,
   });
 
   final String uri;
@@ -216,11 +223,20 @@ class _ContentUriImage extends StatefulWidget {
   final IconData icon;
   final bool highRes;
 
+  /// 解码边长覆盖（null = 按 [decodeSizeFor] 吸档）。背景模糊强档传 100。
+  final int? decodeSide;
+
+  /// 加载中占位（null = 默认 shimmer）。
+  final Widget? loadingPlaceholder;
+
+  /// 无封面/加载失败占位（null = 默认音符图标）。
+  final Widget? errorPlaceholder;
+
   @override
-  State<_ContentUriImage> createState() => _ContentUriImageState();
+  State<ContentUriImage> createState() => _ContentUriImageState();
 }
 
-class _ContentUriImageState extends State<_ContentUriImage> {
+class _ContentUriImageState extends State<ContentUriImage> {
   static const _channel = MethodChannel('shiyin_music/local_music');
   Uint8List? _bytes;
   bool _loading = true;
@@ -236,7 +252,7 @@ class _ContentUriImageState extends State<_ContentUriImage> {
   }
 
   @override
-  void didUpdateWidget(covariant _ContentUriImage oldWidget) {
+  void didUpdateWidget(covariant ContentUriImage oldWidget) {
     super.didUpdateWidget(oldWidget);
     // 播放页/悬浮唱片用常量 PageStorageKey + keep-alive 复用同一 State，
     // 切歌只换 widget.uri。不在此重载，content:// 封面会一直停在上一首
@@ -280,16 +296,19 @@ class _ContentUriImageState extends State<_ContentUriImage> {
   @override
   Widget build(BuildContext context) {
     if (_loading) {
-      return _ShimmerBox(size: widget.size, borderRadius: widget.borderRadius);
+      return widget.loadingPlaceholder ??
+          _ShimmerBox(size: widget.size, borderRadius: widget.borderRadius);
     }
     if (_bytes == null) {
-      return _Fallback(icon: widget.icon);
+      return widget.errorPlaceholder ?? _Fallback(icon: widget.icon);
     }
+    final side = widget.decodeSide ??
+        decodeSizeFor(widget.size, highRes: widget.highRes);
     return Image.memory(
       _bytes!,
       fit: BoxFit.cover,
-      cacheWidth: decodeSizeFor(widget.size, highRes: widget.highRes),
-      cacheHeight: decodeSizeFor(widget.size, highRes: widget.highRes),
+      cacheWidth: side,
+      cacheHeight: side,
     );
   }
 }

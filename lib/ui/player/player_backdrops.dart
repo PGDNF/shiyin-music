@@ -113,17 +113,27 @@ class _ArtworkBackgroundState extends State<ArtworkBackground>
     final maxDim = math.max(size.width, size.height);
     final squareSize = maxDim * 1.2;
     // 走磁盘缓存链路：重进播放页时背景从本地字节秒出，不再等网络往返。
-    // 模糊档用 100×100 缩略图：高斯模糊作用在小图上，改 sigma 的重栅格化
-    // 成本极低（设置页滑块可实时预览）；0 档不模糊，改走全分辨率，
-    // 否则全屏放大缩略图只会得到马赛克而不是「清晰原图」。
-    Widget coverImage(String url, {bool thumbnail = true}) =>
-        RetryableNetworkImage(
-          url: url,
-          fit: BoxFit.cover,
-          cacheWidth: thumbnail ? 100 : null,
-          cacheHeight: thumbnail ? 100 : null,
-          errorBuilder: (context, error, stackTrace) => const SizedBox.shrink(),
-        );
+    // 本地音乐封面是 content:// 专辑 URI，走本地通道（与海报封面同链路）。
+    // 解码档位对齐 md3：sigma≥30 强模糊只留低频，100px 小图足够且改 sigma
+    // 的重栅格化极便宜（滑块实时预览）；sigma<30 保留中频结构，走全分辨率
+    // 避免小图放大的色带穿帮；0 档不模糊同样全分辨率。
+    final int? decodeSide = widget.blurSigma >= 30 ? 100 : null;
+    Widget coverImage(String url) => url.startsWith('content://')
+        ? ContentUriImage(
+            uri: url,
+            size: double.infinity,
+            decodeSide: decodeSide,
+            loadingPlaceholder: const SizedBox.shrink(),
+            errorPlaceholder: const SizedBox.shrink(),
+          )
+        : RetryableNetworkImage(
+            url: url,
+            fit: BoxFit.cover,
+            cacheWidth: decodeSide,
+            cacheHeight: decodeSide,
+            errorBuilder: (context, error, stackTrace) =>
+                const SizedBox.shrink(),
+          );
 
     // 旋转动画背景是纯装饰性的，仅桌面 Windows 排除语义树（AXTree 竞态）。
     // 外层 RepaintBoundary 把整块装饰背景与上层 UI 的图层彻底隔离：
@@ -152,31 +162,25 @@ class _ArtworkBackgroundState extends State<ArtworkBackground>
                   turns: _rotationController,
                   child: RepaintBoundary(
                     child: widget.blurSigma <= 0
-                        ? coverImage(coverUrl, thumbnail: false)
+                        ? coverImage(coverUrl)
                         : ImageFiltered(
                             imageFilter: ImageFilter.blur(
                               sigmaX: widget.blurSigma,
                               sigmaY: widget.blurSigma,
+                              // Impeller 默认 decal 会把图层外透明黑卷进
+                              // 卷积核 → 屏幕四周暗晕（md3 同坑）；clamp
+                              // 以边缘像素延续，暗晕消失、观感更亮。
+                              tileMode: TileMode.clamp,
                             ),
                             child: coverImage(coverUrl),
                           ),
                   ),
                 ),
               ),
-            DecoratedBox(
-              decoration: BoxDecoration(
-                gradient: LinearGradient(
-                  begin: Alignment.topCenter,
-                  end: Alignment.bottomCenter,
-                  colors: [
-                    Colors.black.withValues(alpha: .32),
-                    Colors.black.withValues(alpha: .56),
-                    Colors.black.withValues(alpha: .82),
-                  ],
-                ),
-              ),
-            ),
-            ColoredBox(color: Colors.black.withValues(alpha: .12)),
+            // 蒙版对齐 md3：均匀 rgba(0,0,0,0.35)。旧版 .32/.56/.82 渐变
+            // 再叠 .12 底部过暗，封面色彩几乎被吃掉；均匀 0.35 既保文字
+            // 对比度又留住封面亮度与色相。
+            const ColoredBox(color: Color(0x59000000)),
           ],
         ),
       ),
