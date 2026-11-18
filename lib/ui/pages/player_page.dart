@@ -336,44 +336,69 @@ class _PlayerBodyState extends State<_PlayerBody>
                 backgroundColor: Colors.black,
                 body: Stack(
                   children: [
-                    ArtworkBackground(
-                      song: widget.song,
-                      playing: widget.player.isPlaying,
-                      // 与 _lyricPageVisible 互补：划到歌词页后封面页仍被
-                      // PageView（allowImplicitScrolling）缓存在树上，不门控
-                      // 的话整屏旋转 + 模糊会继续按刷新率空转。
-                      pageVisible: _page == 0 || _pageScrolling,
-                      blurSigma: widget.player.coverBlurSigma,
-                      rotationEnabled: widget.player.coverRotationEnabled,
-                    ),
-                    // Apple Music 流光背景（md3Music 移植）：视觉上仅歌词页
-                    // 显示，与模糊封面交叉淡入淡出；但 ticker 与 shader 自
-                    // 播放页打开即常驻（对齐 md3 稳态）——若在手势内冷启动，
-                    // Impeller 管线首编译 + 驱动冷启动会叠进滑动帧造成掉帧。
-                    // Opacity=0 跳过绘制，常驻成本只有 uniform 推进；管线由
-                    // FlowingBackground 离屏预热。划回海报页仅视觉淡出。
+                    // 封面/歌词页共用背景（对齐 md3 互斥模型）：流光开启 →
+                    // 两页都只渲染流光（模糊层 Opacity=0 跳过绘制省 GPU）；
+                    // 流光关闭 → 两页都渲染可调模糊封面。开关切换走 400ms
+                    // 交叉淡化；背景不随 PageView 切页变化，滑动零背景重绘。
                     ListenableBuilder(
                       listenable: LyricPreferences.instance,
                       builder: (context, _) {
                         final flowingEnabled =
                             LyricPreferences.instance.useFlowingBackground;
-                        return AnimatedOpacity(
-                          opacity: flowingEnabled && _lyricPageVisible
-                              ? 1.0
-                              : 0.0,
-                          duration: const Duration(milliseconds: 400),
-                          child: TickerMode(
-                            enabled: flowingEnabled,
-                            child: Theme(
-                              data: ThemeData(brightness: Brightness.dark),
-                              child: RepaintBoundary(
-                                child: FlowingBackground(
-                                  artworkUrl: widget.song.coverUrl,
-                                  isPlaying: widget.player.isPlaying,
+                        return Stack(
+                          fit: StackFit.expand,
+                          children: [
+                            AnimatedOpacity(
+                              opacity: flowingEnabled ? 0.0 : 1.0,
+                              duration: const Duration(milliseconds: 400),
+                              child: TickerMode(
+                                enabled: !flowingEnabled,
+                                child: ArtworkBackground(
+                                  song: widget.song,
+                                  playing: widget.player.isPlaying,
+                                  // 背景两页共用且始终可见：旋转只由开关/
+                                  // 播放态/应用生命周期门控（组件内部）。
+                                  pageVisible: true,
+                                  blurSigma: widget.player.coverBlurSigma,
+                                  // 流光开启时模糊层不可见，旋转无意义且
+                                  // 白费每帧变换，直接关掉。
+                                  rotationEnabled:
+                                      widget.player.coverRotationEnabled &&
+                                      !flowingEnabled,
                                 ),
                               ),
                             ),
-                          ),
+                            // Apple Music 流光背景（md3Music 移植）：ticker
+                            // 与 shader 自播放页打开即常驻，管线离屏预热，
+                            // 滑动手势帧上不叠任何冷启动开销。0.35 暗蒙版
+                            // 对齐 md3，保证两页文字/控件对比度。
+                            AnimatedOpacity(
+                              opacity: flowingEnabled ? 1.0 : 0.0,
+                              duration: const Duration(milliseconds: 400),
+                              child: TickerMode(
+                                enabled: flowingEnabled,
+                                child: Theme(
+                                  data: ThemeData(brightness: Brightness.dark),
+                                  child: RepaintBoundary(
+                                    child: Stack(
+                                      fit: StackFit.expand,
+                                      children: [
+                                        FlowingBackground(
+                                          artworkUrl: widget.song.coverUrl,
+                                          isPlaying: widget.player.isPlaying,
+                                        ),
+                                        ColoredBox(
+                                          color: Colors.black.withValues(
+                                            alpha: .35,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ],
                         );
                       },
                     ),

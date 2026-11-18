@@ -231,7 +231,7 @@ class _LyricAnimationSettingsPageState
               SwitchListTile(
                 contentPadding: const EdgeInsets.symmetric(horizontal: 16),
                 title: const Text('流光背景'),
-                subtitle: const Text('歌词页显示封面取色驱动的流光渐变背景'),
+                subtitle: const Text('封面与歌词页共用：封面取色驱动的流光渐变背景'),
                 value: prefs.useFlowingBackground,
                 onChanged: prefs.setUseFlowingBackground,
               ),

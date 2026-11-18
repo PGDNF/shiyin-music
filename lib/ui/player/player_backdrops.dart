@@ -24,9 +24,9 @@ class ArtworkBackground extends StatefulWidget {
   /// 纯装饰动画暂停不动无可感知差异。
   final bool playing;
 
-  /// 宿主页面是否可见。播放页是 PageView，划到歌词页后封面页仍被
-  /// `allowImplicitScrolling` 缓存在树上，若不门控，整屏旋转+模糊会
-  /// 在被划走的页面里继续按显示刷新率空转。
+  /// 宿主页面是否可见：不可见时冻结旋转，避免整屏模糊+变换按刷新率空转。
+  /// 播放页背景为封面/歌词页共用（始终可见），宿主恒传 true；门控交给
+  /// 播放态、旋转开关与应用生命周期。
   final bool pageVisible;
 
   /// 高斯模糊强度（0 = 跳过模糊层，清晰原图）。默认 30 对齐 md3Music。

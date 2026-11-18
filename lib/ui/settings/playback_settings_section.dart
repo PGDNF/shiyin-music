@@ -181,7 +181,8 @@ class PlaybackSettingsSection extends StatelessWidget {
         iconColor: const Color(0xFF8E24AA),
         title: '封面背景旋转',
         subtitle: player.coverRotationEnabled
-            ? '播放时背景封面缓慢旋转（40 秒一圈），暂停或划走即冻结'
+            ? '播放时模糊背景缓慢旋转（40 秒一圈），暂停或退后台即冻结；'
+                  '流光开启时背景为流光，旋转不生效'
             : '背景封面保持静止（默认，更省电）；打开后播放时缓慢旋转',
         value: player.coverRotationEnabled,
         onChanged: player.setCoverRotationEnabled,
@@ -426,7 +427,7 @@ class _CoverBlurSliderTile extends StatelessWidget {
                     ),
                     const SizedBox(height: 2),
                     Text(
-                      '高斯模糊强度，0 = 清晰原图（默认 30，对齐 md3Music）',
+                      '封面/歌词页共用背景的模糊强度，0 = 清晰原图（默认 30）',
                       style: Theme.of(context).textTheme.bodySmall?.copyWith(
                         color: colorScheme.onSurfaceVariant,
                         fontSize: 12,
