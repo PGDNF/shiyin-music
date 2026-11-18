@@ -1828,6 +1828,9 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
     if (muted != _tickerModeMuted) {
       _tickerModeMuted = muted;
       _syncEcoDriver();
+      // 划入歌词页（mute→unmute）：把可见窗口的字形/副行准备摊到后续帧，
+      // 避免全部挤在首帧 paint 内联执行。
+      if (!muted) _scheduleVisibleWindowPrewarm();
     }
   }
 
@@ -2254,6 +2257,8 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
       _lastReportedFocusLine = -1;
       // 切歌诊断日志：定位"切歌后省电模式失效须重新开关"问题用（低频事件）
       _syncEcoDriver();
+      // 新歌可见窗口同样逐帧预热（缓存刚被清空，首帧后布局已就绪）
+      _scheduleVisibleWindowPrewarm();
     }
     // P0-A: 非逐字歌词在播放中可能已停 Ticker（静止省电）。position 更新
     //（约 200ms，经 ListenableBuilder 重建本 widget）时唤醒一帧：若确实
@@ -4884,6 +4889,36 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
       _wordRendererFor(index).prepareFor(line, _cachedFontSize);
     }
     if (_auxSubHeightOf(index) > 0) _requestAuxTextImage(index);
+  }
+
+  /// 划入/切歌时的可见窗口预热游标（每帧只准备一行，摊平首帧集中开销）。
+  int _prewarmWindowCursor = 0;
+  bool _prewarmWindowScheduled = false;
+
+  void _scheduleVisibleWindowPrewarm() {
+    if (_prewarmWindowScheduled || _tickerModeMuted || _lifecycleSuspended) {
+      return;
+    }
+    _prewarmWindowScheduled = true;
+    _prewarmWindowCursor = 0;
+    SchedulerBinding.instance.addPostFrameCallback(_pumpVisibleWindowPrewarm);
+  }
+
+  void _pumpVisibleWindowPrewarm(Duration _) {
+    _prewarmWindowScheduled = false;
+    if (!mounted || _tickerModeMuted || _lifecycleSuspended) return;
+    // 锚位约 0.38：可见窗口约为焦点线上 3 行、下 8 行；当前行由 _prewarmLine 跳过。
+    const offsets = [-3, -2, -1, 1, 2, 3, 4, 5, 6, 7, 8];
+    while (_prewarmWindowCursor < offsets.length) {
+      final index = _currentLineIndex + offsets[_prewarmWindowCursor++];
+      if (index < 0 || index >= widget.lines.length) continue;
+      _prewarmLine(index);
+      break;
+    }
+    if (_prewarmWindowCursor < offsets.length) {
+      _prewarmWindowScheduled = true;
+      SchedulerBinding.instance.addPostFrameCallback(_pumpVisibleWindowPrewarm);
+    }
   }
 
   /// 帧末预热下一行。同一目标只排一次回调（[_prewarmTarget] 去重）。

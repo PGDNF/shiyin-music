@@ -183,95 +183,102 @@ class _ShiyinAppleLyricsState extends State<ShiyinAppleLyrics> {
   Widget build(BuildContext context) {
     final lines = _convertIfNeeded();
     // 锚位跟随「歌词动画」页设置：拖动歌词时的准星胶囊与歌词焦点线同位。
-    return ListenableBuilder(
-      listenable: LyricPreferences.instance,
-      builder: (context, _) {
-        return LayoutBuilder(
-          builder: (context, constraints) {
-            final targetY =
-                constraints.maxHeight * LyricPreferences.instance.alignPosition;
-        final focusedLine =
-            (_holding &&
-                _focusIndex >= 0 &&
-                _focusIndex < widget.lyrics.length)
-            ? widget.lyrics[_focusIndex]
-            : null;
-        return TickerMode(
-          enabled: widget.isPageVisible,
-          child: Stack(
-            children: [
-              AppleLyricsView(
-                lines: lines,
-                currentTimeMs: widget.player.lyricPosition.inMilliseconds,
-                isPlaying: widget.player.isPlaying && widget.isPageVisible,
-                playbackNotReady: widget.player.isPreparing,
-                positionListenable: _posNotifier,
-                forceDarkBackground: true,
-                enableInterludeDots: lines.any((l) => l.words.isNotEmpty),
-                onSeek: (ms) => unawaited(
-                  widget.player.seekToAndPlay(Duration(milliseconds: ms)),
-                ),
-                onLongPress: widget.onLongPressLine,
-                onUserScrollingChanged: (holding) {
-                  if (!mounted) return;
-                  setState(() {
-                    _holding = holding;
-                    if (!holding) _focusIndex = -1;
-                  });
-                },
-                onScrollFocusLineChanged: (index) {
-                  if (!mounted || index == _focusIndex) return;
-                  setState(() => _focusIndex = index);
-                },
-              ),
-              // 准星参考线与右侧时间胶囊（与原 MobileLyricList 同款视觉）。
-              if (focusedLine != null)
-                Positioned(
-                  left: 0,
-                  right: 12,
-                  top: targetY - 14,
-                  height: 28,
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.center,
-                    children: [
-                      Expanded(
-                        child: Container(
-                          height: 1,
-                          margin: const EdgeInsets.only(right: 10),
-                          decoration: BoxDecoration(
-                            gradient: LinearGradient(
-                              colors: [
-                                Colors.white.withValues(alpha: 0.0),
-                                Colors.white.withValues(alpha: 0.08),
-                                Colors.white.withValues(alpha: 0.28),
-                                Colors.white.withValues(alpha: 0.14),
-                              ],
+    // 外层 RepaintBoundary：歌词层与宿主背景/准星胶囊隔离成独立图层，
+    // 歌词每帧重绘不会连带宿主 Stack 一起 raster（对齐 md3 的分层）。
+    return RepaintBoundary(
+      child: ListenableBuilder(
+        listenable: LyricPreferences.instance,
+        builder: (context, _) {
+          return LayoutBuilder(
+            builder: (context, constraints) {
+              final targetY =
+                  constraints.maxHeight *
+                  LyricPreferences.instance.alignPosition;
+              final focusedLine =
+                  (_holding &&
+                      _focusIndex >= 0 &&
+                      _focusIndex < widget.lyrics.length)
+                  ? widget.lyrics[_focusIndex]
+                  : null;
+              return TickerMode(
+                enabled: widget.isPageVisible,
+                child: Stack(
+                  children: [
+                    AppleLyricsView(
+                      lines: lines,
+                      currentTimeMs: widget.player.lyricPosition.inMilliseconds,
+                      isPlaying: widget.player.isPlaying && widget.isPageVisible,
+                      playbackNotReady: widget.player.isPreparing,
+                      positionListenable: _posNotifier,
+                      forceDarkBackground: true,
+                      enableInterludeDots: lines.any((l) => l.words.isNotEmpty),
+                      onSeek: (ms) => unawaited(
+                        widget.player.seekToAndPlay(Duration(milliseconds: ms)),
+                      ),
+                      onLongPress: widget.onLongPressLine,
+                      onUserScrollingChanged: (holding) {
+                        if (!mounted) return;
+                        setState(() {
+                          _holding = holding;
+                          if (!holding) _focusIndex = -1;
+                        });
+                      },
+                      onScrollFocusLineChanged: (index) {
+                        if (!mounted || index == _focusIndex) return;
+                        setState(() => _focusIndex = index);
+                      },
+                    ),
+                    // 准星参考线与右侧时间胶囊（与原 MobileLyricList 同款视觉）。
+                    if (focusedLine != null)
+                      Positioned(
+                        left: 0,
+                        right: 12,
+                        top: targetY - 14,
+                        height: 28,
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.center,
+                          children: [
+                            Expanded(
+                              child: Container(
+                                height: 1,
+                                margin: const EdgeInsets.only(right: 10),
+                                decoration: BoxDecoration(
+                                  gradient: LinearGradient(
+                                    colors: [
+                                      Colors.white.withValues(alpha: 0.0),
+                                      Colors.white.withValues(alpha: 0.08),
+                                      Colors.white.withValues(alpha: 0.28),
+                                      Colors.white.withValues(alpha: 0.14),
+                                    ],
+                                  ),
+                                ),
+                              ),
                             ),
-                          ),
+                            LyricSeekPointerButton(
+                              key: const ValueKey(
+                                'mobile_lyric_seek_pointer_button',
+                              ),
+                              timeText: formatDuration(focusedLine.time),
+                              onTap: () {
+                                unawaited(
+                                  widget.player.seekToAndPlay(focusedLine.time),
+                                );
+                                setState(() {
+                                  _holding = false;
+                                  _focusIndex = -1;
+                                });
+                              },
+                            ),
+                          ],
                         ),
                       ),
-                      LyricSeekPointerButton(
-                        key: const ValueKey('mobile_lyric_seek_pointer_button'),
-                        timeText: formatDuration(focusedLine.time),
-                        onTap: () {
-                          unawaited(
-                            widget.player.seekToAndPlay(focusedLine.time),
-                          );
-                          setState(() {
-                            _holding = false;
-                            _focusIndex = -1;
-                          });
-                        },
-                      ),
-                    ],
-                  ),
+                  ],
                 ),
-            ],
-          ),
-        );
-          },
-        );
-      },
+              );
+            },
+          );
+        },
+      ),
     );
   }
 }

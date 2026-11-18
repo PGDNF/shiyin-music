@@ -76,6 +76,9 @@ class FlowingBackground extends StatefulWidget {
   /// 不再重试，避免每进一次播放器就重新尝试加载 + 打日志。
   static bool _shaderUnavailable = false;
 
+  /// 进程级管线是否已离屏预热（Impeller 首次提交才编译管线）。
+  static bool _pipelineWarmed = false;
+
   /// 测试注入点：替换 `ui.FragmentProgram.fromAsset`（测试环境无 GPU，真实
   /// 加载必然失败，用它验证"加载失败 → 回退"分支）。
   @visibleForTesting
@@ -91,6 +94,7 @@ class FlowingBackground extends StatefulWidget {
     _program = null;
     _programRequest = null;
     _shaderUnavailable = false;
+    _pipelineWarmed = false;
     debugProgramLoader = null;
   }
 
@@ -632,6 +636,46 @@ class _FlowingBackgroundState extends State<FlowingBackground>
       _shader = shader;
       _rebuildShaderPainter();
     });
+    _warmShaderPipeline();
+  }
+
+  /// 离屏光栅一帧 16×16，把 Impeller 管线编译提前到挂载期。
+  ///
+  /// 宿主把流光常驻在 Opacity=0（跳过绘制）以对齐 md3 稳态，若不预热，
+  /// 管线首编译会落在封面→歌词滑动手势的第一可见帧上造成掉帧。
+  /// 管线编译与绘制尺寸无关，小图即可命中同一份进程级管线缓存；
+  /// 用独立的 uniform 状态，不污染在屏 painter 的脏检查基准。
+  void _warmShaderPipeline() {
+    if (_pipelineWarmed || _shader == null) return;
+    _pipelineWarmed = true;
+    final shader = _shader!;
+    final values = Float32List(FlowingUniforms.uniformFloatCount);
+    final state = FlowingUniformState();
+    const size = Size(16, 16);
+    writeFlowingUniforms(
+      values,
+      size: size,
+      time: 0,
+      motion: 0,
+      dim: 0,
+      palette: FlowingPalette.fallback,
+      state: state,
+    );
+    state.flush(shader);
+    final recorder = ui.PictureRecorder();
+    Canvas(recorder).drawRect(Offset.zero & size, Paint()..shader = shader);
+    final picture = recorder.endRecording();
+    unawaited(
+      picture
+          .toImage(16, 16)
+          .then((image) {
+            image.dispose();
+            picture.dispose();
+          })
+          .catchError((_) {
+            picture.dispose();
+          }),
+    );
   }
 
   /// 重建 shader painter（**只在 shader 实例变化时**，调色板变化不再重建它）。

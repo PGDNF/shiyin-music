@@ -344,24 +344,31 @@ class _PlayerBodyState extends State<_PlayerBody>
                       // 的话整屏旋转 + sigma24 模糊会继续按刷新率空转。
                       pageVisible: _page == 0 || _pageScrolling,
                     ),
-                    // Apple Music 流光背景（md3Music 移植）：仅歌词页显示，
-                    // 与模糊封面交叉淡入淡出。TickerMode 门控共享节拍驱动，
-                    // 划回海报页即零帧源；Opacity=0 时跳过绘制。
+                    // Apple Music 流光背景（md3Music 移植）：视觉上仅歌词页
+                    // 显示，与模糊封面交叉淡入淡出；但 ticker 与 shader 自
+                    // 播放页打开即常驻（对齐 md3 稳态）——若在手势内冷启动，
+                    // Impeller 管线首编译 + 驱动冷启动会叠进滑动帧造成掉帧。
+                    // Opacity=0 跳过绘制，常驻成本只有 uniform 推进；管线由
+                    // FlowingBackground 离屏预热。划回海报页仅视觉淡出。
                     ListenableBuilder(
                       listenable: LyricPreferences.instance,
                       builder: (context, _) {
-                        final flowingActive = _lyricPageVisible &&
+                        final flowingEnabled =
                             LyricPreferences.instance.useFlowingBackground;
                         return AnimatedOpacity(
-                          opacity: flowingActive ? 1.0 : 0.0,
+                          opacity: flowingEnabled && _lyricPageVisible
+                              ? 1.0
+                              : 0.0,
                           duration: const Duration(milliseconds: 400),
                           child: TickerMode(
-                            enabled: flowingActive,
+                            enabled: flowingEnabled,
                             child: Theme(
                               data: ThemeData(brightness: Brightness.dark),
-                              child: FlowingBackground(
-                                artworkUrl: widget.song.coverUrl,
-                                isPlaying: widget.player.isPlaying,
+                              child: RepaintBoundary(
+                                child: FlowingBackground(
+                                  artworkUrl: widget.song.coverUrl,
+                                  isPlaying: widget.player.isPlaying,
+                                ),
                               ),
                             ),
                           ),
@@ -438,11 +445,13 @@ class _PlayerBodyState extends State<_PlayerBody>
                                                   auth: widget.auth,
                                                   onArtistTap: _openArtist,
                                                   // 海报页被 keep-alive 缓存，划走后需
-                                                  // 停掉歌词预览 ticker（与 _lyricPageVisible
-                                                  // 互补）。
+                                                  // 停掉歌词预览 ticker。手势一开始
+                                                  // （_pageScrolling）就停：预览子树在
+                                                  // 高刷屏上最高 165Hz 重建，滑动期间
+                                                  // 继续跑会与歌词页首帧抢帧预算。
                                                   isPageVisible:
-                                                      _page == 0 ||
-                                                      _pageScrolling,
+                                                      _page == 0 &&
+                                                      !_pageScrolling,
                                                   onCoverTap: () =>
                                                       _openArtist(widget.song),
                                                   onVerticalDragDown:
